@@ -1,3 +1,5 @@
 import requests
-height = requests.get("https://blockchain.info/q/getblockcount", timeout=10).text.strip()
-print("Current Bitcoin block height:", height)
+response = requests.get("https://blockchain.info/latestblock")
+print(response.json())
+print("Latest block height:", response.json()["height"])
+print("Latest block height:", response.json()["height"])
