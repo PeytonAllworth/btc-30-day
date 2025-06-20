@@ -7,6 +7,21 @@ import smtplib
 from email.message import EmailMessage
 from dotenv import load_dotenv
 
+
+
+import argparse
+
+parser = argparse.ArgumentParser(description="BTC Strike Alert CLI")
+
+parser.add_argument("--send", action="store_true", help="Send email alert")
+parser.add_argument("--raw", action="store_true", help="Print full Strike API JSON")
+
+args = parser.parse_args()
+
+
+
+
+
 # Load .env variables
 load_dotenv()
 
@@ -25,6 +40,9 @@ def get_btc_price():
     headers = {"Authorization": f"Bearer {STRIKE_API_KEY}"}
     response = requests.get(url, headers=headers)
     data = response.json()
+    if args.raw:
+        print("🔍 Full JSON:", data)
+
 
   # Find BTC → USD pair
     for item in data:
@@ -82,7 +100,7 @@ threshold = 100_000
 
 
 
-if price < threshold:
+'''if price < threshold:
     message = f"BTC dropped below ${threshold:,.2f}. Current price: ${price:,.2f}! Time to stack more sats?"
     print(message)
     send_email("BTC Price Alert", message, RECIPIENTS)
@@ -90,6 +108,25 @@ else:
     message = f"BTC is steady at ${price:,.2f}. Probably should still stack more sats!"
     print(message)
     send_email("BTC Update", message, RECIPIENTS)
+'''
+
+
+
+
+
+if price < threshold:
+    message = f"BTC dropped below ${threshold:,.2f}. Current price: ${price:,.2f}! Time to stack more sats?"
+else:
+    message = f"BTC is steady at ${price:,.2f}. Probably should still stack more sats!"
+
+print(message)
+
+if args.send:
+    send_email("BTC Price Alert", message, RECIPIENTS)
+    print("📨 Email alert sent.")
+else:
+    print("Private Terminal Response. No Email Sent")
+
 
 
 
