@@ -17,3 +17,13 @@
 - **Error: ValueError** – When a string can’t be converted to an int (e.g. `int("ten")`)
 - **Conditionals** – Using `if` to run code only when something is true
 
+Day 4 – Practiced loops with CS50P Lecture 1; built sum_even.py to reinforce syntax
+
+Day 5 – Day 5.2 – Official sprint task: fetched and printed mempool JSON using requests; tested API error handling; locked in venv + requests setup
+
+---------------------
+# ( Experimental: Alert builder
+Built BTC alert tool using Strike API; sends email to friends if price below threshold of 100k 
+# Experimental: Alert builder)
+
+Day 6 – Added CLI flags (--raw, --send) to BTC alert tool; cleaned output & tested safe email logic
