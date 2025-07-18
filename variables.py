@@ -1,3 +1,9 @@
+STRIKE_API_KEY = "your_api_key_here"
+
+
+
+
+
 # 1. String Variables and Interpolation
 
 # Define name and project
@@ -56,3 +62,10 @@ fiat_value = btc_amount * btc_price
 print(f"Your {sats_owned} sats are worth ${fiat_value:.2f} at ${btc_amount}/BTC")
 
 # Bonus: Format to 2 decimal places
+
+
+
+
+
+
+

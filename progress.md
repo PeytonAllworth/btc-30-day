@@ -27,3 +27,5 @@ Built BTC alert tool using Strike API; sends email to friends if price below thr
 # Experimental: Alert builder)
 
 Day 6 – Added CLI flags (--raw, --send) to BTC alert tool; cleaned output & tested safe email logic
+
+Day 7 reflection - Was a patchy start. busy with moving a vacation and other projects and work. However it was a good introduction week and ive learned enough to see where things are headed. Spent the day learning some python on Quibble!
