@@ -34,3 +34,11 @@ Day 8 step 1 -
 
 Day 8 step 2 - First I Learned how to fetch and print raw Bitcoin transaction data from mempool.space.
 
+Day 9 warm up - Practiced terminal drills (pwd, ls, touch, rm) to build CLI muscle memory.  
+- Jumped into Python REPL and drilled lists (append, pop, slicing) and dictionaries (adding keys, viewing keys/values).  
+- Learned how to add a new key to a dictionary and understood how .pop() affects lists.  
+- Reflected on the difference between list indexing vs. dictionary keys.  
+
+### Screenshots
+![Day 9 Warm-Up 1](images/day9_warmup_1.png)
+![Day 9 Warm-Up 2](images/day9_warmup_2.png)
