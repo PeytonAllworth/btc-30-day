@@ -42,3 +42,7 @@ Day 9 warm up - Practiced terminal drills (pwd, ls, touch, rm) to build CLI musc
 ### Screenshots
 ![Day 9 Warm-Up 1](images/day9_warmup_1.png)
 ![Day 9 Warm-Up 2](images/day9_warmup_2.png)
+
+Day 9 Practicing old projects from muscle memory and then pushing to new limits with AI tools
+
+- I started today’s session coding without Cursor to make sure I was thinking through the logic myself and reinforcing the fundamentals. Once I had a working baseline, I used Cursor as a creative accelerator to help me push my script further and explore more complex comparisons (like fee rate analysis across blocks). I’m mindful not to lean on it too much; I try to write as much as I can independently, using Cursor only to stretch what I’m building rather than shortcutting the learning. Its always cool to let myself use AI tools and build for speed, I really get to accomplish more of what I can imagine then be limited by my coding bottleneck. 
