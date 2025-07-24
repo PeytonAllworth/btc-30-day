@@ -53,3 +53,10 @@ Day 9 assignment:
 - Refactored `latest_block_v2.py` to use a function that returns the latest Bitcoin block height instead of just printing it.
 - Added `raise_for_status()`to catch HTTP errors and learned how `timeout` prevents the script from hanging.
 - Tested failure scenarios by intentionally breaking the API URL and confirmed that the error message prints gracefully instead of crashing.
+
+
+Day 10 assignment:
+
+- wrote a script to check the block height every 10 seconds
+- used library to import time and delay the loop
+- learned about how time is called on by code onto a mchines clock system
