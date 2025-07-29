@@ -99,9 +99,10 @@ def print_cfo_report(results, initial_params):
     print(f"{'Quarter':<10} {'Incremental EPS':>18}")
     print("-" * 32)
     for result in results[::3][:8]:  # first eight quarters only
-        qtr = (result['month'] - 1) // 3 + 1
-        yr = (result['month'] - 1) // 12 + 1
-        label = f"Q{qtr}-Y{yr}"
+        month = result['month']
+        qtr = ((month - 1) % 12) // 3 + 1  # Quarter within the year (1-4)
+        yr = (month - 1) // 12 + 1         # Year number
+        label = f"Y{yr}Q{qtr}"
         # Calculate quarterly EPS (monthly * 3)
         quarterly_eps_sats = result['sats_per_share'] * 3
         print(f"{label:<10} {quarterly_eps_sats:>18,.0f}")
@@ -110,9 +111,9 @@ def print_cfo_report(results, initial_params):
     final = results[-1]
     btc_growth = (final['total_btc'] / initial_params['total_btc_reserves'] - 1) * 100
     print("\n4. Five-Year Headline Metrics")
-    print(f"   • BTC holdings after 5 yr   : {final['total_btc']:.6f} BTC ({btc_growth:.2f}% growth)")
+    print(f"   • BTC holdings after 5 yr:     {final['total_btc']:.6f} BTC ({btc_growth:.2f}% growth)")
     print(f"   • Annual EPS from LN yield — Year 5: {final['sats_per_share']*12:,.0f} sats per share")
-    print(f"   • Cumulative EPS (5 yrs)   : {final['sats_per_share']*12*5:,.0f} sats per share")
+    print(f"   • Cumulative EPS (5 yrs):     {final['sats_per_share']*12*5:,.0f} sats per share")
     
     # Company-wide earnings impact
     lightning_btc = initial_params['total_btc_reserves'] * initial_params['lightning_allocation_percent']
@@ -120,8 +121,8 @@ def print_cfo_report(results, initial_params):
     total_company_annual_earnings_btc = annual_lightning_earnings_btc
     total_company_5yr_earnings_btc = total_company_annual_earnings_btc * 5
     
-    print(f"   • Company annual earnings   : {total_company_annual_earnings_btc:.6f} BTC from Lightning")
-    print(f"   • Company 5-yr earnings     : {total_company_5yr_earnings_btc:.6f} BTC total\n")
+    print(f"   • Company annual earnings:     {total_company_annual_earnings_btc:.6f} BTC from Lightning")
+    print(f"   • Company 5-yr earnings:       {total_company_5yr_earnings_btc:.6f} BTC total\n")
     
     # 5. Key advantages
     print("5. Why Lightning vs. Traditional BTC or High-Yield DeFi?")
