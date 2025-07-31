@@ -208,6 +208,65 @@ def get_fallback_data():
         'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
+def calculate_implementation_roi(initial_params, results):
+    """Calculate implementation costs, ROI, and break-even analysis"""
+    
+    # Setup costs
+    total_setup_cost = (initial_params['setup_hardware'] + 
+                       initial_params['setup_software'] + 
+                       initial_params['setup_consulting'])
+    
+    # Calculate Lightning allocation in BTC and USD
+    lightning_btc = initial_params['total_btc_reserves'] * initial_params['lightning_allocation_percent']
+    lightning_usd = lightning_btc * initial_params['btc_price']
+    
+    # Calculate annual Lightning earnings
+    annual_lightning_earnings_btc = lightning_btc * initial_params['lightning_annual_yield']
+    
+    # Get final year data for projections
+    final_result = results[-1]
+    final_btc_price = final_result['btc_price']
+    
+    # Calculate earnings over the time horizon
+    total_lightning_earnings_btc = annual_lightning_earnings_btc * initial_params['years']
+    total_lightning_earnings_usd = total_lightning_earnings_btc * final_btc_price  # Using final year price
+    
+    # Calculate operational costs over time horizon
+    total_operational_costs = initial_params['annual_operational'] * initial_params['years']
+    
+    # Net benefits
+    net_benefits_usd = total_lightning_earnings_usd - total_operational_costs
+    
+    # ROI calculation
+    total_investment = total_setup_cost + total_operational_costs
+    roi_percentage = (net_benefits_usd / total_investment * 100) if total_investment > 0 else 0
+    
+    # Break-even analysis
+    annual_net_benefit = (annual_lightning_earnings_btc * final_btc_price) - initial_params['annual_operational']
+    break_even_years = total_setup_cost / annual_net_benefit if annual_net_benefit > 0 else float('inf')
+    
+    # Payback period (including operational costs)
+    cumulative_benefit = 0
+    payback_year = None
+    for year in range(1, initial_params['years'] + 1):
+        year_benefit = (annual_lightning_earnings_btc * final_btc_price) - initial_params['annual_operational']
+        cumulative_benefit += year_benefit
+        if cumulative_benefit >= total_setup_cost and payback_year is None:
+            payback_year = year
+    
+    return {
+        'total_setup_cost': total_setup_cost,
+        'total_operational_costs': total_operational_costs,
+        'total_investment': total_investment,
+        'total_lightning_earnings_usd': total_lightning_earnings_usd,
+        'net_benefits_usd': net_benefits_usd,
+        'roi_percentage': roi_percentage,
+        'break_even_years': break_even_years,
+        'payback_year': payback_year,
+        'annual_net_benefit': annual_net_benefit,
+        'lightning_allocation_usd': lightning_usd
+    }
+
 def calculate_optimal_allocation(treasury_size, live_data):
     """Calculate optimal Lightning allocation based on treasury size and real-time network data"""
     current_capacity = live_data['network_capacity']['total_capacity_btc']
@@ -241,7 +300,11 @@ def calculate_lightning_yield_impact(
     years,
     lightning_allocation_percent=0.10,  # Default 10% allocation to Lightning
     btc_price=50000.0,  # Current BTC price
-    btc_cagr=0.15  # Expected BTC CAGR
+    btc_cagr=0.15,  # Expected BTC CAGR
+    setup_hardware=50000,  # Hardware setup costs
+    setup_software=25000,  # Software/licensing costs
+    setup_consulting=100000,  # Consulting/implementation costs
+    annual_operational=50000  # Annual operational costs
 ):
     """
     Calculate the impact of Lightning Network yield strategies on EPS and sats per share.
@@ -378,15 +441,38 @@ def print_cfo_report(results, initial_params):
     print(f"   • Company annual earnings:     {total_company_annual_earnings_btc:.6f} BTC from Lightning (${total_company_annual_earnings_btc * final['btc_price']:,.2f})")
     print(f"   • Company {years}-yr earnings:       {total_company_final_earnings_btc:.6f} BTC total (${total_company_final_earnings_btc * final['btc_price']:,.2f})\n")
     
-    # 5. Key advantages
-    print("5. Why Lightning vs. Traditional BTC or High-Yield DeFi?")
+    # 5. Implementation ROI Analysis
+    roi_data = calculate_implementation_roi(initial_params, results)
+    print("5. Implementation ROI Analysis")
+    print(f"   • Total setup costs:        ${roi_data['total_setup_cost']:,.0f}")
+    print(f"   • Total operational costs:  ${roi_data['total_operational_costs']:,.0f}")
+    print(f"   • Total investment:         ${roi_data['total_investment']:,.0f}")
+    print(f"   • Lightning allocation:     ${roi_data['lightning_allocation_usd']:,.0f}")
+    print(f"   • Total Lightning earnings: ${roi_data['total_lightning_earnings_usd']:,.0f}")
+    print(f"   • Net benefits:             ${roi_data['net_benefits_usd']:,.0f}")
+    print(f"   • ROI:                      {roi_data['roi_percentage']:.1f}%")
+    
+    if roi_data['break_even_years'] != float('inf'):
+        print(f"   • Break-even timeline:      {roi_data['break_even_years']:.1f} years")
+    else:
+        print(f"   • Break-even timeline:      Never (costs exceed benefits)")
+    
+    if roi_data['payback_year']:
+        print(f"   • Payback period:           Year {roi_data['payback_year']}")
+    else:
+        print(f"   • Payback period:           Beyond {years} years")
+    
+    print(f"   • Annual net benefit:       ${roi_data['annual_net_benefit']:,.0f}\n")
+    
+    # 6. Key advantages
+    print("6. Why Lightning vs. Traditional BTC or High-Yield DeFi?")
     print("   • Non-custodial – coins remain in      client-controlled multi-sig")
     print("   • Risk profile – no rehypothecation,   no smart-contract exploits")
     print("   • GAAP benefit – sat income reported   under ASC 350-60 each quarter")
     print("   • Shareholder optics – BTC-per-share   grows without dilution\n")
     
-    # 6. mNAV and investor interest advantage
-    print("6. Market NAV Premium & Share Dilution Strategy")
+    # 7. mNAV and investor interest advantage
+    print("7. Market NAV Premium & Share Dilution Strategy")
     print("   • Lightning yield creates measurable EPS growth vs. passive BTC holders")
     print("   • Measured growth attracts investor interest = higher mNAV premium")
     print("   • Higher mNAV enables more profitable ATM share dilution")
@@ -397,8 +483,8 @@ def print_cfo_report(results, initial_params):
     print("   • Competitive edge: Mega-holders (>10k BTC) can't replicate this today")
     print("   • Mid-sized treasuries (1-5k BTC) enjoy temporary, high-margin opportunity\n")
     
-    # 7. Why Act Now
-    print("7. Why Act Now")
+    # 8. Why Act Now
+    print("8. Why Act Now")
     print("   • Accounting tailwind: ASC 350-60 (effective FY 2025) first cycle for Lightning EPS")
     print("   • Early adopters publish first 'Lightning EPS' lines in Q1 2026 earnings")
     print("   • Later entrants become 'me-too' - diminishing headline value")
@@ -453,6 +539,13 @@ def get_cfo_inputs():
     lightning_allocation_percent = float(input("\n⚡ Lightning Allocation (% of BTC Treasury): ") or "10.0") / 100
     years = int(input("📅 Time Horizon (years): ") or "5")
     
+    # Implementation cost inputs
+    print(f"\n💰 IMPLEMENTATION COSTS:")
+    setup_hardware = float(input("   Hardware setup costs ($): ") or "50000")
+    setup_software = float(input("   Software/licensing costs ($): ") or "25000")
+    setup_consulting = float(input("   Consulting/implementation ($): ") or "100000")
+    annual_operational = float(input("   Annual operational costs ($): ") or "50000")
+    
     return {
         'total_btc_reserves': total_btc_reserves,
         'lightning_annual_yield': lightning_annual_yield,
@@ -461,7 +554,11 @@ def get_cfo_inputs():
         'lightning_allocation_percent': lightning_allocation_percent,
         'years': years,
         'btc_price': btc_price,
-        'btc_cagr': btc_cagr
+        'btc_cagr': btc_cagr,
+        'setup_hardware': setup_hardware,
+        'setup_software': setup_software,
+        'setup_consulting': setup_consulting,
+        'annual_operational': annual_operational
     }
     
     return {
