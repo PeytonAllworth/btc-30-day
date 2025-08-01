@@ -159,6 +159,142 @@ def fetch_current_btc_price():
         print(f"   ⚠️  Could not fetch BTC price: {e}")
     return None
 
+def fetch_treasury_data():
+    """Fetch real treasury data from bitcointreasuries.net"""
+    try:
+        print("   📊 Fetching treasury data from bitcointreasuries.net...")
+        response = requests.get('https://bitcointreasuries.net/', timeout=15)
+        
+        if response.status_code == 200:
+            # Parse the HTML to extract treasury data
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Look for the treasury table
+            treasury_data = []
+            
+            # Try to find the main treasury table
+            tables = soup.find_all('table')
+            for table in tables:
+                rows = table.find_all('tr')
+                for row in rows[1:]:  # Skip header row
+                    cells = row.find_all(['td', 'th'])
+                    if len(cells) >= 3:
+                        try:
+                            company = cells[0].get_text(strip=True)
+                            btc_holdings_text = cells[1].get_text(strip=True)
+                            
+                            # Extract BTC amount (remove commas and 'BTC')
+                            btc_holdings = btc_holdings_text.replace(',', '').replace(' BTC', '').replace('$', '')
+                            
+                            # Try to convert to float
+                            try:
+                                btc_amount = float(btc_holdings)
+                                treasury_data.append({
+                                    'company': company,
+                                    'btc_holdings': btc_amount
+                                })
+                            except ValueError:
+                                continue
+                                
+                        except (IndexError, ValueError):
+                            continue
+            
+            # If we couldn't parse the table, use fallback data
+            if not treasury_data:
+                print("   ⚠️  Could not parse treasury data, using fallback")
+                return get_fallback_treasury_data()
+            
+            # Sort by BTC holdings and return top companies
+            treasury_data.sort(key=lambda x: x['btc_holdings'], reverse=True)
+            return treasury_data[:10]  # Top 10 companies
+            
+        else:
+            print(f"   ⚠️  Could not fetch treasury data (Status: {response.status_code})")
+            return get_fallback_treasury_data()
+            
+    except Exception as e:
+        print(f"   ⚠️  Could not fetch treasury data: {e}")
+        return get_fallback_treasury_data()
+
+def get_fallback_treasury_data():
+    """Return fallback treasury data when scraping fails"""
+    return [
+        {'company': 'MicroStrategy', 'btc_holdings': 214400},
+        {'company': 'Tesla', 'btc_holdings': 10725},
+        {'company': 'Block', 'btc_holdings': 8027},
+        {'company': 'Marathon Digital', 'btc_holdings': 15000},
+        {'company': 'Riot Platforms', 'btc_holdings': 12000},
+        {'company': 'Coinbase', 'btc_holdings': 10000},
+        {'company': 'Hut 8 Mining', 'btc_holdings': 9000},
+        {'company': 'CleanSpark', 'btc_holdings': 8000},
+        {'company': 'Bitfarms', 'btc_holdings': 7000},
+        {'company': 'Cipher Mining', 'btc_holdings': 6000}
+    ]
+
+def calculate_competitive_analysis(initial_params, treasury_data):
+    """Calculate competitive analysis comparing your strategy to other treasuries"""
+    
+    your_btc = initial_params['total_btc_reserves']
+    your_lightning_yield = initial_params['lightning_annual_yield']
+    your_allocation = initial_params['lightning_allocation_percent']
+    btc_price = initial_params['btc_price']
+    
+    competitive_analysis = []
+    
+    for company in treasury_data:
+        company_btc = company['btc_holdings']
+        company_name = company['company']
+        
+        # Calculate potential Lightning allocation (10% of their BTC)
+        potential_lightning_btc = company_btc * 0.10
+        
+        # Calculate annual Lightning earnings
+        annual_lightning_earnings_btc = potential_lightning_btc * your_lightning_yield
+        
+        # Estimate shares outstanding (rough estimates)
+        estimated_shares = {
+            'MicroStrategy': 17000000,
+            'Tesla': 3200000000,
+            'Block': 620000000,
+            'Marathon Digital': 250000000,
+            'Riot Platforms': 200000000,
+            'Coinbase': 250000000,
+            'Hut 8 Mining': 100000000,
+            'CleanSpark': 50000000,
+            'Bitfarms': 40000000,
+            'Cipher Mining': 30000000
+        }
+        
+        shares = estimated_shares.get(company_name, 100000000)  # Default 100M shares
+        
+        # Calculate potential EPS impact
+        annual_eps_btc = annual_lightning_earnings_btc / shares
+        annual_eps_usd = annual_eps_btc * btc_price
+        
+        # Determine competitive advantage
+        if company_btc > 50000:
+            advantage = "Too large - would crash Lightning fees"
+        elif company_btc > 10000:
+            advantage = "Sweet spot - could deploy without market impact"
+        elif company_name == 'Block':
+            advantage = "Already doing Lightning (9.7% yield demonstrated)"
+        else:
+            advantage = "Good size for Lightning deployment"
+        
+        competitive_analysis.append({
+            'company': company_name,
+            'btc_holdings': company_btc,
+            'potential_lightning_btc': potential_lightning_btc,
+            'annual_lightning_earnings_btc': annual_lightning_earnings_btc,
+            'estimated_shares': shares,
+            'annual_eps_btc': annual_eps_btc,
+            'annual_eps_usd': annual_eps_usd,
+            'advantage': advantage
+        })
+    
+    return competitive_analysis
+
 def test_lightning_apis():
     """Test which APIs are working"""
     print("Testing available APIs...")
@@ -207,6 +343,66 @@ def get_fallback_data():
         },
         'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
+
+def calculate_minimum_channel_size(initial_params, results):
+    """Calculate minimum Lightning channel size needed to break even in each quarter"""
+    
+    # Setup costs (one-time)
+    total_setup_cost = (initial_params['setup_hardware'] + 
+                       initial_params['setup_software'] + 
+                       initial_params['setup_consulting'])
+    
+    # Annual operational costs
+    annual_operational = initial_params['annual_operational']
+    
+    # Lightning yield rate
+    lightning_yield = initial_params['lightning_annual_yield']
+    
+    # Shares outstanding
+    shares_outstanding = initial_params['shares_outstanding']
+    
+    min_channel_sizes = []
+    
+    for result in results[::3]:  # Every 3rd month (quarterly)
+        month = result['month']
+        current_btc_price = result['btc_price']
+        
+        # Calculate quarter number
+        qtr = ((month - 1) % 12) // 3 + 1
+        yr = (month - 1) // 12 + 1
+        
+        # Monthly operational costs in BTC at current price
+        monthly_operational_btc = (annual_operational / 12) / current_btc_price
+        
+        # To break even: Lightning earnings = Operational costs
+        # Lightning earnings = channel_size * monthly_yield_rate
+        # Operational costs = monthly_operational_btc
+        # Therefore: channel_size = monthly_operational_btc / monthly_yield_rate
+        
+        monthly_yield_rate = lightning_yield / 12
+        min_channel_size_btc = monthly_operational_btc / monthly_yield_rate
+        
+        # Calculate total costs to date (setup + operational)
+        months_elapsed = month
+        total_operational_to_date = (annual_operational / 12) * months_elapsed
+        total_costs_to_date_usd = total_setup_cost + total_operational_to_date
+        
+        # Calculate minimum channel size to cover all costs to date
+        total_lightning_earnings_needed_btc = total_costs_to_date_usd / current_btc_price
+        min_channel_size_for_total_costs_btc = total_lightning_earnings_needed_btc / (monthly_yield_rate * months_elapsed)
+        
+        min_channel_sizes.append({
+            'quarter': f"Y{yr}Q{qtr}",
+            'month': month,
+            'btc_price': current_btc_price,
+            'min_channel_operational_btc': min_channel_size_btc,
+            'min_channel_operational_usd': min_channel_size_btc * current_btc_price,
+            'min_channel_total_costs_btc': min_channel_size_for_total_costs_btc,
+            'min_channel_total_costs_usd': min_channel_size_for_total_costs_btc * current_btc_price,
+            'total_costs_to_date_usd': total_costs_to_date_usd
+        })
+    
+    return min_channel_sizes
 
 def calculate_implementation_roi(initial_params, results):
     """Calculate implementation costs, ROI, and break-even analysis"""
@@ -349,10 +545,35 @@ def calculate_lightning_yield_impact(
         months_elapsed = month - 1
         current_btc_price = btc_price * (1 + btc_cagr) ** (months_elapsed / 12)
         
-        # Calculate EPS and sats per share (Bitcoin-focused)
-        total_earnings_btc = lightning_yield + traditional_yield
-        eps = total_earnings_btc / shares_outstanding
-        sats_per_share = total_earnings_btc * 100_000_000 / shares_outstanding  # Monthly sats per share
+        # Calculate gross earnings from Lightning and traditional yields
+        lightning_earnings_btc = lightning_yield
+        traditional_earnings_btc = traditional_yield
+        total_gross_earnings_btc = lightning_earnings_btc + traditional_earnings_btc
+        
+        # Calculate operational costs (monthly) - fixed in USD, converted at current month's BTC price
+        monthly_operational_costs_usd = annual_operational / 12
+        monthly_operational_costs_btc = monthly_operational_costs_usd / current_btc_price  # Use current month's BTC price
+        
+        # Calculate net earnings (gross earnings minus operational costs)
+        net_earnings_btc = total_gross_earnings_btc - monthly_operational_costs_btc
+        
+        # Calculate EPS and sats per share (net earnings)
+        eps = net_earnings_btc / shares_outstanding
+        sats_per_share = net_earnings_btc * 100_000_000 / shares_outstanding  # Monthly sats per share
+        
+        # Debug output for first month
+        if month == 1:
+            print(f"\n🔍 DEBUG - Month 1 Calculation:")
+            print(f"   Lightning allocation: {lightning_btc:.6f} BTC")
+            print(f"   Lightning monthly yield: {lightning_monthly_yield:.6f}")
+            print(f"   Lightning earnings: {lightning_earnings_btc:.6f} BTC")
+            print(f"   Monthly operational costs: ${monthly_operational_costs_usd:.2f}")
+            print(f"   Monthly operational costs BTC: {monthly_operational_costs_btc:.6f} BTC")
+            print(f"   Gross earnings: {total_gross_earnings_btc:.6f} BTC")
+            print(f"   Net earnings: {net_earnings_btc:.6f} BTC")
+            print(f"   Shares outstanding: {shares_outstanding}")
+            print(f"   EPS: {eps:.6f} BTC")
+            print(f"   Sats per share: {sats_per_share:.2f}")
         
         # Calculate USD values
         eps_usd = eps * current_btc_price
@@ -369,7 +590,7 @@ def calculate_lightning_yield_impact(
             'lightning_btc': lightning_balance,
             'traditional_btc': traditional_balance,
             'total_btc': total_btc_balance,
-            'monthly_earnings_btc': total_earnings_btc,
+            'monthly_earnings_btc': net_earnings_btc,
             'eps': eps,
             'sats_per_share': sats_per_share,
             'eps_usd': eps_usd,
@@ -421,7 +642,7 @@ def print_cfo_report(results, initial_params):
         quarterly_eps_usd = result['sats_per_share_usd'] * 3
         btc_price = result['btc_price']
         
-        print(f"{label:<10} {quarterly_eps_sats:>12,.0f} ${quarterly_eps_usd:>11,.2f} ${btc_price:>11,.0f}")
+        print(f"{label:<10} {quarterly_eps_sats:>12,.2f} ${quarterly_eps_usd:>11,.2f} ${btc_price:>11,.0f}")
     
     # 4. Final year headline metrics
     final = results[-1]
@@ -464,15 +685,79 @@ def print_cfo_report(results, initial_params):
     
     print(f"   • Annual net benefit:       ${roi_data['annual_net_benefit']:,.0f}\n")
     
-    # 6. Key advantages
-    print("6. Why Lightning vs. Traditional BTC or High-Yield DeFi?")
+    # 6. Minimum Channel Size Analysis
+    min_channel_data = calculate_minimum_channel_size(initial_params, results)
+    print("6. Minimum Lightning Channel Size for Break-Even")
+    print(f"{'Quarter':<10} {'Operational Only':>15} {'Total Costs':>15} {'BTC Price':>12}")
+    print("-" * 60)
+    
+    # Show first 8 quarters and last 4 quarters
+    for i, data in enumerate(min_channel_data):
+        if i < 8 or i >= len(min_channel_data) - 4:  # First 8 and last 4
+            operational_usd = data['min_channel_operational_usd']
+            total_costs_usd = data['min_channel_total_costs_usd']
+            btc_price = data['btc_price']
+            
+            print(f"{data['quarter']:<10} ${operational_usd:>14,.0f} ${total_costs_usd:>14,.0f} ${btc_price:>11,.0f}")
+    
+    if len(min_channel_data) > 12:
+        print(f"{'...':<10} {'...':>15} {'...':>15} {'...':>12}")
+    
+    # Summary
+    first_quarter = min_channel_data[0]
+    last_quarter = min_channel_data[-1]
+    print(f"\n   • To cover operational costs only: {first_quarter['min_channel_operational_btc']:.3f} BTC (${first_quarter['min_channel_operational_usd']:,.0f}) in Q1")
+    print(f"   • To cover operational costs only: {last_quarter['min_channel_operational_btc']:.3f} BTC (${last_quarter['min_channel_operational_usd']:,.0f}) in final quarter")
+    print(f"   • To cover all costs to date: {last_quarter['min_channel_total_costs_btc']:.3f} BTC (${last_quarter['min_channel_total_costs_usd']:,.0f}) in final quarter")
+    print(f"   • Your current allocation: {initial_params['total_btc_reserves'] * initial_params['lightning_allocation_percent']:.3f} BTC\n")
+    
+    # 7. Competitive Treasury Analysis
+    treasury_data = fetch_treasury_data()
+    competitive_data = calculate_competitive_analysis(initial_params, treasury_data)
+    
+    print("7. Competitive Treasury Analysis")
+    print(f"{'Company':<20} {'BTC Holdings':>12} {'Lightning Potential':>18} {'EPS Impact':>12} {'Status':>25}")
+    print("-" * 95)
+    
+    # Show top 6 companies
+    for company in competitive_data[:6]:
+        company_name = company['company']
+        btc_holdings = company['btc_holdings']
+        lightning_potential = company['potential_lightning_btc']
+        eps_impact = company['annual_eps_usd']
+        advantage = company['advantage']
+        
+        print(f"{company_name:<20} {btc_holdings:>12,.0f} {lightning_potential:>18,.0f} ${eps_impact:>11,.2f} {advantage:<25}")
+    
+    # Add your company for comparison
+    your_lightning_btc = initial_params['total_btc_reserves'] * initial_params['lightning_allocation_percent']
+    your_annual_earnings = your_lightning_btc * initial_params['lightning_annual_yield']
+    your_eps = your_annual_earnings * initial_params['btc_price'] / initial_params['shares_outstanding']
+    
+    print(f"{'YOUR COMPANY':<20} {initial_params['total_btc_reserves']:>12,.0f} {your_lightning_btc:>18,.0f} ${your_eps:>11,.2f} {'Perfect size for deployment':<25}")
+    
+    # Market opportunity analysis
+    total_corporate_btc = sum(company['btc_holdings'] for company in treasury_data)
+    estimated_lightning_capacity = 15000  # Estimated Lightning capacity
+    your_capacity_share = your_lightning_btc / estimated_lightning_capacity * 100
+    
+    print(f"\n🏆 COMPETITIVE ADVANTAGES:")
+    print(f"   • Total corporate BTC: {total_corporate_btc:,.0f} BTC")
+    print(f"   • Estimated Lightning capacity: {estimated_lightning_capacity:,.0f} BTC")
+    print(f"   • Your allocation: {your_lightning_btc:.0f} BTC = {your_capacity_share:.1f}% of available capacity")
+    print(f"   • First-mover advantage: Secure capacity before others enter")
+    print(f"   • Size arbitrage: Mega-holders can't deploy without crushing fees")
+    print(f"   • Mid-sized sweet spot: {initial_params['total_btc_reserves']:,.0f} BTC is optimal for Lightning\n")
+    
+    # 8. Key advantages
+    print("8. Why Lightning vs. Traditional BTC or High-Yield DeFi?")
     print("   • Non-custodial – coins remain in      client-controlled multi-sig")
     print("   • Risk profile – no rehypothecation,   no smart-contract exploits")
     print("   • GAAP benefit – sat income reported   under ASC 350-60 each quarter")
     print("   • Shareholder optics – BTC-per-share   grows without dilution\n")
     
-    # 7. mNAV and investor interest advantage
-    print("7. Market NAV Premium & Share Dilution Strategy")
+    # 9. mNAV and investor interest advantage
+    print("9. Market NAV Premium & Share Dilution Strategy")
     print("   • Lightning yield creates measurable EPS growth vs. passive BTC holders")
     print("   • Measured growth attracts investor interest = higher mNAV premium")
     print("   • Higher mNAV enables more profitable ATM share dilution")
@@ -483,8 +768,8 @@ def print_cfo_report(results, initial_params):
     print("   • Competitive edge: Mega-holders (>10k BTC) can't replicate this today")
     print("   • Mid-sized treasuries (1-5k BTC) enjoy temporary, high-margin opportunity\n")
     
-    # 8. Why Act Now
-    print("8. Why Act Now")
+    # 10. Why Act Now
+    print("10. Why Act Now")
     print("   • Accounting tailwind: ASC 350-60 (effective FY 2025) first cycle for Lightning EPS")
     print("   • Early adopters publish first 'Lightning EPS' lines in Q1 2026 earnings")
     print("   • Later entrants become 'me-too' - diminishing headline value")
@@ -540,11 +825,11 @@ def get_cfo_inputs():
     years = int(input("📅 Time Horizon (years): ") or "5")
     
     # Implementation cost inputs
-    print(f"\n💰 IMPLEMENTATION COSTS:")
-    setup_hardware = float(input("   Hardware setup costs ($): ") or "50000")
-    setup_software = float(input("   Software/licensing costs ($): ") or "25000")
-    setup_consulting = float(input("   Consulting/implementation ($): ") or "100000")
-    annual_operational = float(input("   Annual operational costs ($): ") or "50000")
+    print(f"\n💰 IMPLEMENTATION COSTS (Annual):")
+    setup_hardware = float(input("   Hardware setup costs (one-time, $): ") or "50000")
+    setup_software = float(input("   Software/licensing costs (one-time, $): ") or "25000")
+    setup_consulting = float(input("   Consulting/implementation (one-time, $): ") or "100000")
+    annual_operational = float(input("   Annual operational costs ($/year): ") or "50000")
     
     return {
         'total_btc_reserves': total_btc_reserves,
