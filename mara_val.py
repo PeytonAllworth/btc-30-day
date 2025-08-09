@@ -25,11 +25,32 @@ def get_mara_market_cap():
 
 def main():
     print("=== MARA Miner Valuation Tool (Quick-Start) ===")
+    print()
+    
     btc_price = get_btc_price()
     market_cap = get_mara_market_cap()
+    print()
 
-    print(f"BTC Price: ${btc_price:,.0f}")
-    print(f"MARA Market Cap: ${market_cap:,.0f}")
+    print(f"💰 BTC Price: ${btc_price:,.0f}")
+    print(f"📊 MARA Market Cap: ${market_cap:,.0f}")
+    print()
+
+    btc_units = 50639
+    treasury_value = btc_units * btc_price
+    print(f"🏦 Treasury (BTC holdings x price): ${treasury_value:,.0f}")
+    print()
+
+    cash = 100_000_000
+    total_debt = 2_630_000_000
+    nav_simple = treasury_value + cash - total_debt
+    print(f"💵 Cash: ${cash:,.0f}")
+    print(f"💳 Total Debt: ${total_debt:,.0f}")
+    print(f"📈 NAV (treasury + cash - debt): ${nav_simple:,.0f}")
+    print()
+
+    mnav = market_cap / treasury_value
+    print(f"🎯 mNAV (Market Cap / Treasury): {mnav:.2f}x")
+    print()
 
     # Placeholder for later:
     print("[A] Snapshot — TODO")
