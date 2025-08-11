@@ -1,0 +1,23 @@
+[
+  {
+    "period": "2025-06-30",
+    "label": "Warrant FV loss (non-cash)",
+    "impact_on_core": 25000000,
+    "reason": "financing noise",
+    "category": "financing"
+  },
+  {
+    "period": "2025-06-30",
+    "label": "Acquisition costs",
+    "impact_on_core": 3000000,
+    "reason": "pre-operating expansion",
+    "category": "future"
+  },
+  {
+    "period": "2025-03-31",
+    "label": "Debt extinguishment gain",
+    "impact_on_core": -12000000,
+    "reason": "non-core gain",
+    "category": "debt"
+  }
+]

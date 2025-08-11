@@ -111,6 +111,12 @@ You'd lean on mNAV and the per-quarter Core table until Core turns positive.
 
 **ACMPE (Allworth Core Mining P/E) = RBV ÷ Core TTM, where Core = Net Income − BTC Revaluation + Interest. It prices the mining business itself—stripping out BTC price noise and neutralizing leverage—so you can judge operational value, not balance-sheet luck.**
 
+## PRIME mNAV (Peyton's Risk-Integrated Miner mNAV)
+I adjust mNAV by an operations P/E view:
+Fair mNAV = (Treasury + Cash − Debt + PE × Core TTM) ÷ Treasury
+Where Core TTM = sum over 4q of (Net Income − BTC Revaluation + Interest), Ops-Only.
+I show scenarios (Value 5× / Market 8× / Growth 11×). If Core TTM ≤ 0, PE × Core is negative.
+
 ### Project Files
 
 - **`mara_val_redo.py`** - Simple MARA valuation tool with ACMPE calculation
