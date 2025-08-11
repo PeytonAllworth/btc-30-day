@@ -184,6 +184,7 @@ def fetch_sec_financials():
             if int_units:
                 latest_interest = latest_quarterly(int_units)
                 results["interest"] = latest_interest.get("val")
+                results["interest_period"] = latest_interest.get("end")
                 print(f"   Found Quarterly Interest: ${results['interest']:,.0f}")
 
             # Try a few generic investment reval concepts (may/may not exist for BTC)
@@ -194,6 +195,7 @@ def fetch_sec_financials():
                 if units:
                     latest_btc = latest_quarterly(units)
                     results["btc_reval"] = latest_btc.get("val")
+                    results["btc_reval_period"] = latest_btc.get("end")
                     print(f"   Found investment reval (quarterly): ${results['btc_reval']:,.0f}")
                     break
 
@@ -394,21 +396,21 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
     lines.append(f"   • mNAV = Market Cap / Treasury   = {fmt_float(mnav)}x")
     lines.append("")
     lines.append("[3] Normalization (strip BTC volatility, isolate debt)")
-    ni_p = metrics.get('reported_ni_period')
-    br_p = metrics.get('btc_reval_period')
-    int_p = metrics.get('interest_period')
+    ni_p = sec_data.get('ni_period') if sec_data else None
+    rev_p = sec_data.get('btc_reval_period') if sec_data else None
+    int_p = sec_data.get('interest_period') if sec_data else None
     
-    lines.append(f"   • Reported Net Income [{metrics.get('reported_ni_source','?')}]: {fmt_dollars(metrics.get('reported_ni'))}" + (f" [{ni_p}]" if ni_p else ""))
+    lines.append(f"   • Reported Net Income [SEC]: {fmt_dollars(metrics.get('reported_ni'))}" + (f" [{ni_p}]" if ni_p else ""))
     br = metrics.get('btc_reval')
     br_tag = sec_data.get('btc_reval_concept') if sec_data else None
-    lines.append(f"   • BTC Revaluation (SEC):     {fmt_dollars(br)}" + (f" [{br_tag}]" if br_tag else "") + (f" [{br_p}]" if br_p else ""))
+    lines.append(f"   • BTC Revaluation (SEC):     {fmt_dollars(br)}" + (f" [{br_tag}]" if br_tag else "") + (f" [{rev_p}]" if rev_p else ""))
     lines.append(f"   • Interest Expense (SEC):    {fmt_dollars(metrics.get('interest'))}" + (f" [{int_p}]" if int_p else ""))
     
-    if metrics["adj_ni_aligned"] is not None:
-        lines.append(f"   • Adjusted NI (aligned):     {fmt_dollars(metrics['adj_ni_aligned'])}")
-        lines.append(f"   • Adjusted NI (no debt, aligned): {fmt_dollars(metrics['adj_ni_no_debt_aligned'])}")
+    if metrics["adj_ni"] is not None:
+        lines.append(f"   • Adjusted NI: {fmt_dollars(metrics['adj_ni'])}")
+        lines.append(f"   • Adjusted NI (no debt): {fmt_dollars(metrics['adj_ni_no_debt'])}")
     else:
-        lines.append("   • Adjusted NI: Skipped — SEC periods not aligned (apples≠oranges).")
+        lines.append("   • Adjusted NI: Skipped — different quarters.")
     
     # Add quarterly history table
     lines.append("")
@@ -725,28 +727,10 @@ def main():
         "interest": None
     }
 
-    # Prefer SEC NI for normalization; keep Yahoo for display only
+    # Use SEC NI only for normalization
     sec_ni = sec_data.get("net_income") if sec_data else None
-    yf_ni = financials.get("reported_ni") if financials else None
-
-    # If both exist and differ a lot, warn
-    def pct_diff(a, b):
-        try:
-            return abs(a - b) / (abs(b) + 1e-9)
-        except Exception:
-            return None
-
-    if sec_ni is not None:
-        if yf_ni is not None:
-            pdiff = pct_diff(yf_ni, sec_ni)
-            if pdiff is not None and pdiff > 0.25:
-                print(f"⚠️  Data Quality: Yahoo NI {yf_ni:,.0f} vs SEC NI {sec_ni:,.0f} differ by {pdiff*100:.0f}%. Using SEC NI for normalization.")
-        metrics["reported_ni"] = sec_ni  # overwrite: normalize on SEC
-        metrics["reported_ni_source"] = "SEC"
-        metrics["reported_ni_period"] = sec_data.get("ni_period")
-    else:
-        metrics["reported_ni"] = yf_ni
-        metrics["reported_ni_source"] = "Yahoo"
+    metrics["reported_ni"] = sec_ni
+    metrics["reported_ni_source"] = "SEC"
 
     if sec_data:
         metrics["btc_reval"] = sec_data.get("btc_reval")
@@ -754,19 +738,21 @@ def main():
         metrics["interest"] = sec_data.get("interest")
         metrics["interest_period"] = sec_data.get("interest_period")
 
-    # Check period alignment and compute aligned adjusted NI
-    ni_p = metrics.get('reported_ni_period')
-    br_p = metrics.get('btc_reval_period')
-    int_p = metrics.get('interest_period')
-    
-    aligned_adj = None
-    if ni_p and br_p and int_p and (ni_p == br_p == int_p):
-        aligned_adj = metrics["reported_ni"] - metrics["btc_reval"]
-        metrics["adj_ni_aligned"] = aligned_adj
-        metrics["adj_ni_no_debt_aligned"] = aligned_adj + metrics["interest"]
+    # Only compute Adjusted NI when periods match
+    ni_p = sec_data.get("ni_period") if sec_data else None
+    rev_p = sec_data.get("btc_reval_period") if sec_data else None
+    int_p = sec_data.get("interest_period") if sec_data else None
+
+    if ni_p and rev_p and int_p and (ni_p == rev_p == int_p):
+        adj = metrics["reported_ni"] - metrics["btc_reval"]
+        adj_no_debt = adj + metrics["interest"]
+        metrics["adj_ni"] = adj
+        metrics["adj_ni_no_debt"] = adj_no_debt
     else:
-        metrics["adj_ni_aligned"] = None
-        metrics["adj_ni_no_debt_aligned"] = None
+        adj = None
+        adj_no_debt = None  # skip if quarters don't align
+        metrics["adj_ni"] = None
+        metrics["adj_ni_no_debt"] = None
 
     # Evaluate & decide
     crit = DecisionCriteria()
