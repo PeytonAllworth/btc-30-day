@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+MARA Miner Valuation Tool
+Fetches MARA and BTC data, prints human-readable explainer report, optionally emails it.
+"""
+
 import requests
 import yfinance as yf
 import json
@@ -6,7 +12,11 @@ import smtplib
 from dataclasses import dataclass
 from email.mime.text import MIMEText
 from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
 
+# Flags
+OVERRIDE_MODE = os.getenv("OVERRIDE_MODE", "0") == "1"
+OVERRIDE_PATH = os.getenv("OVERRIDE_PATH", "overrides/core_quarters.json")
 
 # === Metric labels ===
 METRIC_NAME = "Allworth Core Mining P/E"
@@ -14,6 +24,45 @@ METRIC_SHORT = "ACMPE"
 
 # === Feature flags ===
 SHOW_FORWARD = os.getenv("SHOW_FORWARD", "0") == "1"
+
+# Manual TTM dataset for when SEC quarters don't align
+MARA_MANUAL_QUARTERS = [
+    {
+        "period": "2024-12-31",
+        "ni": 162_470_667,
+        "reval_used": 0,
+        "interest": 8_033_000,
+        "policy": "pre-ASU",
+        "source": "Peyton 2025-08-11"
+    },
+    {
+        "period": "2025-03-31",
+        "ni": -533_443_000,
+        "reval_used": -510_267_000,
+        "interest": 9_941_000,
+        "policy": "post-ASU",
+        "source": "Peyton 2025-08-11"
+    },
+    {
+        "period": "2025-06-30",
+        "ni": 808_235_000,
+        "reval_used": 1_192_574_000,
+        "interest": 12_835_000,
+        "policy": "post-ASU",
+        "source": "Peyton 2025-08-11"
+    },
+    {
+        "period": "2024-09-30",
+        "ni": 12_725_000,
+        "reval_used": 0,
+        "interest": 2_342_000,
+        "policy": "pre-ASU",
+        "source": "Peyton 2025-08-11"
+    }
+]
+
+# Flag to use manual TTM dataset
+USE_MANUAL_TTM = os.getenv("USE_MANUAL_TTM", "0") == "1"
 
 
 def fmt_dollars(x: Optional[float]) -> str:
@@ -250,50 +299,20 @@ def fetch_sec_financials():
         return None
 
 def get_total_debt():
-    """
-    Try Yahoo Finance first (quarterly balance sheet). 
-    Fallback to SEC XBRL us-gaap concepts if needed.
-    Returns a number (latest quarter) or None.
-    """
-    # 1) Yahoo
+    """Get total debt from Yahoo Finance"""
     try:
         mara = yf.Ticker("MARA")
-        bs = mara.quarterly_balance_sheet
-        if bs is not None and not bs.empty:
-            latest = bs.iloc[:, 0]
-            candidates = {
-                "long_term": ["Long Term Debt", "LongTermDebt"],
-                "short_term": ["Short Long Term Debt", "Current Debt", "Short Term Borrowings", "Debt Current"]
-            }
-            long_term = next((latest.get(k) for k in candidates["long_term"] if k in latest.index), 0)
-            short_term = next((latest.get(k) for k in candidates["short_term"] if k in latest.index), 0)
-
-            total = 0
-            if long_term is not None: total += float(long_term)
-            if short_term is not None: total += float(short_term)
-
-            if total > 0:
-                return total
-    except Exception as e:
-        print(f"⚠️ Yahoo debt fetch failed: {e}")
-
-    # 2) SEC fallback
-    try:
-        data = fetch_sec_financials()  # you already call this; we'll extend it to return debt pieces
-        if not data:
+        balance_sheet = mara.balance_sheet
+        
+        if balance_sheet.empty:
             return None
-
-        debt_parts = []
-        for key in ("debt_current", "long_term_debt", "long_term_debt_and_capital_leases"):
-            if data.get(key) is not None:
-                debt_parts.append(float(data[key]))
-
-        if debt_parts:
-            return sum(debt_parts)
+        
+        # Get most recent total debt
+        total_debt = balance_sheet.loc['Total Debt'].iloc[0]
+        return float(total_debt)
     except Exception as e:
-        print(f"⚠️ SEC debt fallback failed: {e}")
-
-    return None
+        print(f"Error getting total debt: {e}")
+        return None
 
 
 def evaluate_signals(metrics: Dict[str, Any], crit: DecisionCriteria) -> Dict[str, Any]:
@@ -434,6 +453,7 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
         lines.append(f"   • ACMPE-TTM = RBV ÷ Core TTM = {fmt_mult(acmpe)}")
         lines.append(f"   • RBV (Residual Business Value) = {fmt_dollars(rbv)}")
         lines.append(f"   • Core TTM (4 quarters) = {fmt_dollars(core_ttm)}")
+        lines.append("   (Backcasted using ΔFV−ΔCost; pre-2025 removes only downside; interest imputed when missing).")
     else:
         lines.append("   • ACMPE-TTM = N/A (insufficient data or RBV ≤ 0)")
     
@@ -469,18 +489,39 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
     else:
         lines.append("   • Adjusted NI: Skipped — different quarters.")
     
-    # Add quarterly history table
+    # Add quarterly history table (using backcasted data)
     lines.append("")
-    lines.append("[3b] Last 4 Quarters (SEC-only, aligned)")
-    quarterly_rows = build_quarterly_history()
-    if quarterly_rows:
-        lines.append("   Period      ReportedNI   Reval    Interest   AdjNI   AdjNI(no debt)")
-        lines.append("   " + "-" * 70)
-        for row in quarterly_rows:
+    lines.append("[3b] Last 4 Quarters")
+    history_rows = metrics.get('history_rows', [])
+    if history_rows:
+        hdr = "MANUAL OVERRIDES (Peyton)" if metrics.get("override_used") else "SEC-aligned/backcast"
+        lines.append(f"   Source: {hdr} — Policy: pre-ASU removes losses only; post-ASU full reval.")
+        lines.append("   Period       NI           RevalUsed     Interest     Core (= NI - Reval + Int)   Policy   Source")
+        lines.append("   " + "-" * 100)
+        for row in history_rows:
             period = row["period"][:10] if row["period"] else "Unknown"
-            lines.append(f"   {period:<12} {fmt_dollars(row['reported_ni']):<11} {fmt_dollars(row['reval']):<8} {fmt_dollars(row['interest']):<9} {fmt_dollars(row['adj_ni']):<7} {fmt_dollars(row['adj_ni_no_debt'])}")
+            ni_val = row.get('ni', row.get('reported_ni', 0))
+            reval_val = row.get('reval_used', 0)
+            interest_val = row.get('interest', row.get('interest_used', 0))
+            core_val = row.get('core', 0)
+            policy = row.get('policy', '')
+            source = row.get('source', '')
+            
+            lines.append(f"   {period:<12} {fmt_dollars(ni_val):<11} {fmt_dollars(reval_val):<11} {fmt_dollars(interest_val):<11} {fmt_dollars(core_val):<11} {policy:<8} {source}")
     else:
         lines.append("   ⚠️  Could not build quarterly history (missing data)")
+    
+    # Add normalization explanation
+    lines.append("")
+    lines.append("   Normalization: We remove BTC price swings and add back interest.")
+    lines.append("   Core = Net Income - Revaluation + Interest Expense")
+    lines.append("   This isolates operational performance from BTC volatility and debt costs.")
+    lines.append("   Rule: Pre-ASU quarters don't book BTC gains in NI, so we only remove losses there; post-ASU we remove the full revaluation (gain or loss).")
+    
+    # Add overrides note if used
+    if metrics.get("override_used"):
+        lines.append("")
+        lines.append("NOTE: Core uses MANUAL OVERRIDES supplied by Peyton (policy enforced).")
     
     # Add forward projection table
     lines.append("")
@@ -567,18 +608,89 @@ def should_send_email(action: str, period: str) -> bool:
         changed = (last_state.get("action") != action or 
                   last_state.get("period") != period)
         
-        if changed:
-            # Update state
-            new_state = {"action": action, "period": period}
-            with open(state_file, "w") as f:
-                json.dump(new_state, f)
-            return True
-        else:
-            return False
-            
+        # Update state
+        with open(state_file, "w") as f:
+            json.dump({"action": action, "period": period}, f)
+        
+        return changed
     except Exception as e:
-        print(f"⚠️ State check failed: {e}")
-        return True  # Default to sending if state check fails
+        print(f"⚠️  Email state check failed: {e}")
+        return False
+
+
+def build_manual_core_ttm(data: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Build manual core TTM from hard-coded dataset.
+    Returns quarters_core, core_ttm, and negative_core flag.
+    """
+    quarters_core = []
+    core_ttm = 0
+    
+    for quarter_data in data:
+        # Calculate core earnings: NI - reval_total + interest_expense
+        core_q = quarter_data["ni"] - quarter_data["reval_total"] + quarter_data["interest_expense"]
+        
+        quarters_core.append({
+            "quarter": quarter_data["quarter"],
+            "ni": quarter_data["ni"],
+            "reval_total": quarter_data["reval_total"],
+            "interest_expense": quarter_data["interest_expense"],
+            "core_q": core_q,
+            "sources": quarter_data["sources"],
+            "citations": quarter_data["citations"]
+        })
+        
+        core_ttm += core_q
+    
+    negative_core = core_ttm <= 0
+    
+    return {
+        "quarters_core": quarters_core,
+        "core_ttm": core_ttm,
+        "negative_core": negative_core
+    }
+
+
+def apply_policy(row: dict) -> dict:
+    """Pre-ASU (<2025-01-01): remove losses only. Post-ASU: full reval (gain/loss)."""
+    period = row["period"]
+    rv = float(row["reval_used"])
+    policy = (row.get("policy") or "").lower()
+    post = period >= "2025-01-01" or policy == "post-asu"
+    
+    if not post:  # pre-ASU
+        rv = min(rv, 0.0)
+        policy = "pre-ASU"
+    else:
+        policy = "post-ASU"
+    
+    out = dict(row)
+    out["reval_used"] = rv
+    out["policy"] = policy
+    return out
+
+
+def build_core_rows_from_overrides(rows):
+    """Build core earnings rows from manual overrides with policy enforcement"""
+    out = []
+    for r in sorted(rows, key=lambda x: x["period"]):
+        r = apply_policy(r)
+        ni = float(r["ni"])
+        rv = float(r["reval_used"])
+        intr = float(r["interest"])
+        core = ni - rv + intr
+        
+        out.append({
+            "period": r["period"],
+            "reported_ni": ni,
+            "reval_used": rv,
+            "interest_used": intr,
+            "core": core,
+            "policy": r["policy"],
+            "source": r.get("source", "manual")
+        })
+    
+    return out
 
 
 def project_core_q(p: dict) -> dict:
@@ -684,7 +796,7 @@ def sec_reval_series_strict(n: int = 12) -> dict:
         headers = {'User-Agent': 'MARA-Valuation-Tool/1.0 (educational-use@example.com)'}
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        facts = r.json().get("facts") or {}
+        facts = r.json().get("facts", {}) or {}
         for tax, concepts in facts.items():
             for concept, payload in concepts.items():
                 if not looks_like_reval_pnl(concept):
@@ -713,6 +825,48 @@ def sec_reval_series_strict(n: int = 12) -> dict:
 def post_asu(end_date: str) -> bool:
     """Check if period is post-ASU 2023-08 (fiscal years beginning 2025+)"""
     return end_date >= "2025-01-01"  # adjust if MARA early-adopted
+
+
+def sec_fv_series(n: int = 12) -> dict:
+    """Get CryptoAssetFairValue series from SEC"""
+    data = fetch_sec_quarterly_values("CryptoAssetFairValue", n)
+    return {item["end"]: item for item in data}
+
+
+def sec_cost_series(n: int = 12) -> dict:
+    """Get CryptoAssetCost series from SEC"""
+    data = fetch_sec_quarterly_values("CryptoAssetCost", n)
+    return {item["end"]: item for item in data}
+
+
+def estimate_reval_from_bs(fv: dict, cost: dict) -> dict:
+    """
+    Returns {end: est_reval} using ΔFV - ΔCost between consecutive quarterly ends.
+    Requires both FV and Cost for end and prior end.
+    """
+    ends = sorted(set(fv.keys()) & set(cost.keys()))
+    out = {}
+    for i in range(1, len(ends)):
+        curr, prev = ends[i], ends[i-1]
+        fv_curr, fv_prev = fv[curr]["val"], fv[prev]["val"]
+        c_curr, c_prev = cost[curr]["val"], cost[prev]["val"]
+        out[curr] = (fv_curr - fv_prev) - (c_curr - c_prev)
+    return out  # note: first end has no estimate (needs prev)
+
+
+def impute_interest(ie_series: dict, end: str, ends_sorted: list[str]) -> float:
+    """
+    If interest for `end` missing, use the most recent prior quarter's interest.
+    If none prior, use 0 (conservative). Assumes ie_series like {end:{val:...}}.
+    """
+    if end in ie_series:
+        return float(ie_series[end]["val"])
+    idx = ends_sorted.index(end)
+    for j in range(idx - 1, -1, -1):
+        prev = ends_sorted[j]
+        if prev in ie_series:
+            return float(ie_series[prev]["val"])
+    return 0.0  # last resort: treat as 0
 
 
 def fetch_sec_latest_custom_reval(n: int = 1):
@@ -784,43 +938,59 @@ def fetch_sec_latest_custom_reval(n: int = 1):
         return []
 
 
-def fetch_sec_quarterly_values(concept: str, n: int = 8) -> List[Dict[str, Any]]:
-    """
-    Fetch the last n quarterly values for a given SEC concept.
-    Returns list of {end, val} dicts sorted by end date (most recent first).
-    """
+def fetch_sec_quarterly_values(concept: str, n: int = 12) -> dict:
+    """Fetch quarterly values for a concept from SEC CompanyFacts API"""
     try:
         cik = get_cik_from_ticker("MARA")
-        if not cik: return []
+        if not cik:
+            print(f"   ⚠️  Could not find CIK for MARA")
+            return {}
         
-        import time
-        time.sleep(0.1)
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        headers = {'User-Agent': 'MARA-Valuation-Tool/1.0 (educational-use@example.com)'}
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik.zfill(10)}.json"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
         r = requests.get(url, headers=headers, timeout=15)
         r.raise_for_status()
-        data = r.json()
+        facts = r.json().get("facts", {}) or {}
         
-        us_gaap = data.get("facts", {}).get("us-gaap", {})
-        concept_data = us_gaap.get(concept, {})
-        usd_units = concept_data.get("units", {}).get("USD", [])
+        # Look for the concept in us-gaap taxonomy
+        us_gaap_facts = facts.get("us-gaap", {}).get(concept, {}).get("units", {}).get("USD", [])
         
-        if not usd_units:
-            return []
+        print(f"   🔍 Debug: {concept} - Raw facts count: {len(us_gaap_facts)}")
         
-        # Filter for quarterly data
-        quarterly = [
-            x for x in usd_units
-            if x.get("fp") in {"Q1","Q2","Q3","Q4"} or x.get("qtrs") == 1 or x.get("dur") == "P3M"
-        ]
+        quarterly_data = {}
+        quarterly_count = 0
+        for fact in us_gaap_facts:
+            # Check if it's quarterly data
+            if (fact.get("fp") in ["Q1", "Q2", "Q3", "Q4"] or 
+                fact.get("qtrs") == 1 or 
+                fact.get("dur") == "P3M"):
+                
+                quarterly_count += 1
+                end_date = fact.get("end")
+                if end_date:
+                    # If multiple values exist for same end date, pick the one with latest filed date
+                    if end_date not in quarterly_data or fact.get("filed", "") > quarterly_data[end_date].get("filed", ""):
+                        quarterly_data[end_date] = {
+                            "val": fact.get("val"),
+                            "filed": fact.get("filed")
+                        }
         
-        # Sort by end date and take most recent n
-        quarterly.sort(key=lambda x: x.get("end", ""), reverse=True)
-        return [{"end": x.get("end"), "val": x.get("val")} for x in quarterly[:n]]
+        print(f"   🔍 Debug: {concept} - Quarterly facts count: {quarterly_count}")
+        print(f"   🔍 Debug: {concept} - Unique end dates: {len(quarterly_data)}")
+        print(f"   🔍 Debug: {concept} - All end dates: {sorted(quarterly_data.keys())}")
+        
+        # Sort by end date and take the latest n (most recent first)
+        sorted_ends = sorted(quarterly_data.keys(), reverse=True)[:n]
+        result = {end: quarterly_data[end] for end in sorted_ends}
+        print(f"   🔍 Debug: {concept} - Returning {len(result)} periods: {sorted(result.keys())}")
+        return result
         
     except Exception as e:
-        print(f"⚠️ SEC quarterly fetch failed for {concept}: {e}")
-        return []
+        print(f"   ⚠️  Error fetching {concept}: {e}")
+        return {}
 
 
 def build_quarterly_history() -> List[Dict[str, Any]]:
@@ -939,6 +1109,32 @@ def build_aligned_sec_series() -> List[Dict[str, Any]]:
     return rows
 
 
+def compute_rbv(market_cap, treasury_value, cash, total_debt) -> float:
+    """Compute RBV (Residual Business Value)"""
+    return float(market_cap) - (float(treasury_value) + float(cash) - float(total_debt))
+
+
+def compute_acmpe_ttm_from_rows(rows, rbv: float):
+    """Compute ACMPE-TTM from core earnings rows"""
+    core_ttm = sum(r["core"] for r in rows[-4:])
+    acmpe = (rbv / core_ttm) if (rbv > 0 and core_ttm > 0) else None
+    return core_ttm, acmpe
+
+
+def dqc_log_line(metrics: dict):
+    """Log data quality metrics to file"""
+    try:
+        with open("dqc.log", "a") as f:
+            src = "overrides" if metrics.get("override_used") else "sec/backcast"
+            acmpe = metrics.get("acmpe_ttm")
+            acmpe_str = "N/A" if acmpe is None else f"{acmpe:.2f}"
+            hist = metrics.get("history_rows") or []
+            periods = ",".join(r["period"] for r in hist)
+            f.write(f"{datetime.now().isoformat()} src={src} periods=[{periods}] mnav={metrics.get('mnav')} acmpe_ttm={acmpe_str}\n")
+    except Exception:
+        pass
+
+
 def main():
     print("=== MARA Miner Valuation Tool (Quick-Start) ===")
     print()
@@ -1030,6 +1226,32 @@ def main():
         "interest": None
     }
 
+    # --- Manual overrides path (preferred when enabled) ---
+    metrics["override_used"] = False
+    metrics["history_rows"] = None
+    metrics["core_ttm"] = None
+    metrics["acmpe_ttm"] = None
+
+    if OVERRIDE_MODE:
+        o = load_core_overrides()
+        if o:
+            ok, msg = validate_core_overrides(o)
+            if not ok:
+                print(f"⚠️ Overrides invalid: {msg}; falling back to SEC/backcast.")
+            else:
+                rows = build_core_rows_from_overrides(o)
+                metrics["override_used"] = True
+                metrics["history_rows"] = rows
+                metrics["rbv"] = compute_rbv(market_cap, treasury_value, cash, total_debt)
+                metrics["core_ttm"], metrics["acmpe_ttm"] = compute_acmpe_ttm_from_rows(rows, metrics["rbv"])
+                print(f"   🔧 Using manual overrides (OVERRIDE_MODE=1)")
+                print(f"   📊 Overrides provide {len(rows)} quarters")
+                print(f"   📊 Core TTM: ${metrics['core_ttm']:,.0f}")
+                if metrics["acmpe_ttm"]:
+                    print(f"   📊 ACMPE-TTM: {metrics['acmpe_ttm']:.1f}x")
+                else:
+                    print(f"   ⚠️ ACMPE-TTM: N/A (negative core or RBV)")
+
     # Use SEC NI only for normalization
     sec_ni = sec_data.get("net_income") if sec_data else None
     metrics["reported_ni"] = sec_ni
@@ -1041,49 +1263,245 @@ def main():
         metrics["interest"] = sec_data.get("interest")
         metrics["interest_period"] = sec_data.get("interest_period")
 
-    # Calculate ACMPE-TTM (Allworth Core Mining P/E) with ASU 2023-08 gating
-    # Get strict P&L reval series and check ASU compliance
-    strict_reval = sec_reval_series_strict(12)
-    ni_series = fetch_sec_quarterly_values("NetIncomeLoss", 12)
-    ie_series = fetch_sec_quarterly_values("InterestExpense", 12)
+    # === Build 4Q core using spec-compliant backcasting ===
+    ni = fetch_sec_quarterly_values("NetIncomeLoss", 30)  # Increased more to get to 2025-06-30
+    ie = fetch_sec_quarterly_values("InterestExpense", 30)  # Increased to match
+    fv = fetch_sec_quarterly_values("CryptoAssetFairValue", 12)
+    ct = fetch_sec_quarterly_values("CryptoAssetCost", 12)
     
-    # Build aligned periods with ASU gating
-    aligned = sorted(set(ni.get("end") for ni in ni_series) & 
-                    set(strict_reval.keys()) & 
-                    set(ie.get("end") for ie in ie_series))
+    # Debug: Let's see the raw data we're getting
+    print(f"   🔍 Debug: Raw NI data count: {len(ni)}")
+    print(f"   🔍 Debug: Raw IE data count: {len(ie)}")
+    print(f"   🔍 Debug: Raw FV data count: {len(fv)}")
+    print(f"   🔍 Debug: Raw Cost data count: {len(ct)}")
     
-    post_asu_aligned = [p for p in aligned if post_asu(p)]
+    # Optional: scan for P&L reval concepts (post-2025)
+    pl_reval = {}
+    for concept in ["NetRealizedAndUnrealizedGainLossOnInvestments", 
+                   "UnrealizedGainLossOnInvestments", 
+                   "RealizedGainLossOnInvestments"]:
+        data = fetch_sec_quarterly_values(concept, 12)
+        for end, fact in data.items():
+            if end >= "2025-01-01":  # Only post-ASU
+                pl_reval[end] = {"val": fact["val"], "src": concept}
     
-    # Build core earnings rows for aligned periods
+    # Debug: Print what we're getting
+    print(f"   📊 Data found: NI={len(ni)}, IE={len(ni)}, FV={len(fv)}, Cost={len(ct)}, P&L_Reval={len(pl_reval)}")
+    if ni:
+        print(f"   📊 NI periods: {list(ni.keys())}")
+    if fv:
+        print(f"   📊 FV periods: {list(fv.keys())}")
+    if ct:
+        print(f"   📊 Cost periods: {list(ct.keys())}")
+    
+    # === IMPROVED DATA ALIGNMENT STRATEGY ===
+    # Instead of requiring ALL THREE data points, let's work with what we have
+    # Strategy 1: Try to get 4 quarters with full data (NI + FV + Cost)
+    # Strategy 2: If that fails, use available quarters and estimate missing data
+    # Strategy 3: Fall back to RunRate calculation
+    
+    # Find fully aligned periods (NI + FV + Cost)
+    fully_aligned_ends = sorted(set(ni.keys()) & set(fv.keys()) & set(ct.keys()))
+    print(f"   📊 Fully aligned periods (NI + FV + Cost): {len(fully_aligned_ends)}")
+    if fully_aligned_ends:
+        print(f"   📊 Fully aligned periods: {fully_aligned_ends}")
+    
+    # Debug: Let's see what we're missing
+    print(f"   🔍 Debug: NI keys: {sorted(ni.keys())}")
+    print(f"   🔍 Debug: FV keys: {sorted(fv.keys())}")
+    print(f"   🔍 Debug: Cost keys: {sorted(ct.keys())}")
+    
+    # Check what's missing from each
+    ni_only = set(ni.keys()) - set(fv.keys())
+    fv_only = set(fv.keys()) - set(ni.keys())
+    cost_only = set(ct.keys()) - set(ni.keys())
+    
+    if ni_only:
+        print(f"   🔍 Debug: NI only (missing FV/Cost): {sorted(ni_only)}")
+    if fv_only:
+        print(f"   🔍 Debug: FV only (missing NI): {sorted(fv_only)}")
+    if cost_only:
+        print(f"   🔍 Debug: Cost only (missing NI): {sorted(cost_only)}")
+    
+    # Let's also check what the actual values look like
+    print(f"   🔍 Debug: NI sample data:")
+    for end, data in list(ni.items())[:3]:
+        print(f"      {end}: val={data['val']}, filed={data.get('filed', 'N/A')}")
+    
+    print(f"   🔍 Debug: FV sample data:")
+    for end, data in list(fv.items())[:3]:
+        print(f"      {end}: val={data['val']}, filed={data.get('filed', 'N/A')}")
+    
+    # === BUILD CORE EARNINGS ROWS ===
     rows = []
-    for end in post_asu_aligned:
-        ni_val = next((item["val"] for item in ni_series if item["end"] == end), 0)
-        reval_val = strict_reval[end]["val"]
-        ie_val = next((item["val"] for item in ie_series if item["end"] == end), 0)
-        core = ni_val - reval_val + ie_val
-        rows.append({"period": end, "core": core})
     
-    # Calculate RBV
-    rbv = market_cap - (treasury_value + cash - total_debt)
-    metrics["rbv"] = rbv
+    # Strategy 1: Use fully aligned periods if we have enough
+    if len(fully_aligned_ends) >= 2:  # Need at least 2 for reval calculation
+        print(f"   🔍 Using fully aligned periods for reval calculation")
+        for i in range(1, len(fully_aligned_ends)):  # Need prior end for Δ
+            curr = fully_aligned_ends[i]
+            prev = fully_aligned_ends[i-1]
+            
+            print(f"   🔍 Debug: Processing {curr} vs {prev}")
+            
+            # Estimate reval from balance sheet deltas
+            est_reval = (fv[curr]["val"] - fv[prev]["val"]) - (ct[curr]["val"] - ct[prev]["val"])
+            
+            # Choose reval source and apply accounting rules
+            rv_used = None
+            rv_src = None
+            
+            if curr >= "2025-01-01" and curr in pl_reval:
+                # Post-ASU: use P&L actual if available
+                rv_used = pl_reval[curr]["val"]
+                rv_src = f"P&L: {pl_reval[curr]['src']}"
+            else:
+                # Use estimated reval
+                if curr >= "2025-01-01":
+                    # Post-ASU: use full estimated reval
+                    rv_used = est_reval
+                    rv_src = "Est: ΔFV−ΔCost"
+                else:
+                    # Pre-ASU: only remove downside (impairment)
+                    rv_used = min(est_reval, 0.0)
+                    rv_src = "Est: ΔFV−ΔCost (pre-ASU: downside only)"
+            
+            # Interest with fallback
+            intr = impute_interest(ie, curr, fully_aligned_ends)
+            
+            # Core earnings = NI - reval + interest
+            core = ni[curr]["val"] - rv_used + intr
+            
+            rows.append({
+                "period": curr,
+                "ni": ni[curr]["val"],
+                "reval_used": rv_used,
+                "reval_source": rv_src,
+                "interest": intr,
+                "core": core
+            })
     
-    # TTM only if 4 quarters available
-    if len(rows) >= 4:
-        core_ttm = sum(r["core"] for r in rows[-4:])
+    # STOP: Do not estimate or smooth Net Income. Use SEC us-gaap:NetIncomeLoss only.
+    # Only use quarters where we have actual SEC NI data - no estimation, no smoothing
+    print(f"   📊 Using only quarters with actual SEC NI data (no estimation)")
+    print(f"   📊 Available aligned quarters: {len(rows)}")
+    
+    # Check if we should use manual TTM dataset as fallback
+    if USE_MANUAL_TTM and len(rows) < 4:
+        print(f"   🔧 Using manual TTM dataset (USE_MANUAL_TTM=1)")
+        
+        # Build core rows with policy enforcement
+        core_rows = build_core_rows_from_overrides(MARA_MANUAL_QUARTERS)
+        
+        # Override rows with manual data
+        rows = []
+        for q in core_rows:
+            rows.append({
+                "period": q["period"],
+                "ni": q["reported_ni"],
+                "reval_used": q["reval_used"],
+                "reval_source": f"Manual: {q['source']} ({q['policy']})",
+                "interest": q["interest_used"],
+                "core": q["core"],
+                "policy": q["policy"],
+                "source": q["source"]
+            })
+        
+        # Calculate core TTM
+        core_ttm = sum(q["core"] for q in core_rows)
+        print(f"   📊 Manual dataset provides {len(rows)} quarters")
+        print(f"   📊 Core TTM: ${core_ttm:,.0f}")
+        print(f"   📊 Policy enforcement: Pre-ASU quarters only remove downside, Post-ASU remove full reval")
+    
+    # Sort by period and take last 4 for TTM
+    rows = sorted(rows, key=lambda r: r["period"])
+    last4 = rows[-4:] if len(rows) >= 4 else []
+    
+    # Save to metrics
+    metrics["history_rows"] = last4
+    metrics["rbv"] = market_cap - (treasury_value + cash - total_debt)
+    
+    # Calculate TTM or Run-Rate following the clean rule
+    if last4:
+        core_ttm = sum(r["core"] for r in last4)
         metrics["core_ttm"] = core_ttm
-        metrics["acmpe_ttm"] = (rbv / core_ttm) if (rbv > 0 and core_ttm > 0) else None
-        print(f"   ✅ ACMPE-TTM calculated from {len(rows)} post-ASU aligned quarters")
+        
+        # ACMPE-TTM = RBV ÷ sum(Core of last 4 aligned quarters) if both > 0; else N/A
+        if core_ttm > 0 and metrics["rbv"] > 0:
+            metrics["acmpe_ttm"] = metrics["rbv"] / core_ttm
+            print(f"   ✅ ACMPE-TTM calculated from {len(last4)} quarters: {metrics['acmpe_ttm']:.1f}x")
+        else:
+            metrics["acmpe_ttm"] = None
+            if core_ttm <= 0:
+                print(f"   ⚠️  ACMPE-TTM: Core TTM is negative (${core_ttm:,.0f}) - operations losing money")
+            else:
+                print(f"   ⚠️  ACMPE-TTM: RBV is negative (${metrics['rbv']:,.0f}) - market cap below NAV")
+        
+        # Show 4Q table
+        print("\n[3b] Last 4 Quarters")
+        if metrics.get("history_rows"):
+            hdr = "MANUAL OVERRIDES (Peyton)" if metrics.get("override_used") else "SEC-aligned/backcast"
+            print(f"   Source: {hdr} — Policy: pre-ASU removes losses only; post-ASU full reval.")
+            print("   Period       NI           RevalUsed     Interest     Core (= NI - Reval + Int)   Policy   Source")
+            for r in metrics["history_rows"]:
+                print(f"   {r['period']}  {r['reported_ni']:>12,.0f}  {r['reval_used']:>12,.0f}  {r['interest_used']:>10,.0f}  {r['core']:>18,.0f}   {r['policy']:<8} {r.get('source','')}")
+            rbv_str = f"{metrics.get('rbv', 0):,.0f}"
+            core_ttm_str = "N/A" if metrics.get("core_ttm") is None else f"{metrics['core_ttm']:,.0f}"
+            acmpe_str = "N/A" if metrics.get("acmpe_ttm") is None else f"{metrics['acmpe_ttm']:.1f}x"
+            print(f"   Core TTM: {core_ttm_str}   RBV: {rbv_str}   ACMPE-TTM: {acmpe_str}")
+        else:
+            print("   ⚠️  Not enough quarters yet")
     else:
         metrics["core_ttm"] = None
         metrics["acmpe_ttm"] = None
-        # Optional run-rate (annualize last aligned quarter) — LABEL IT CLEARLY
-        if rows and rbv > 0 and rows[-1]["core"] > 0:
-            metrics["acmpe_runrate"] = rbv / (rows[-1]["core"] * 4)
-            print(f"   ⚠️  ACMPE-TTM: Need 4 post-ASU aligned quarters (found {len(rows)})")
-            print(f"   📊 ACMPE-RunRate (last qtr ×4): {metrics['acmpe_runrate']:.1f}x")
+        
+        # Fallback: Calculate Run-Rate from available quarters
+        if rows and metrics["rbv"] > 0:
+            available_quarters = len(rows)
+            total_core = sum(r["core"] for r in rows)
+            if total_core > 0:
+                # Annualize the available quarters
+                annualized_core = total_core * (4 / available_quarters)
+                metrics["acmpe_runrate"] = metrics["rbv"] / annualized_core
+                print(f"   ⚠️  ACMPE-TTM: Need 4 aligned quarters (found {available_quarters})")
+                print(f"   📊 ACMPE-RunRate (annualized from {available_quarters} quarters): {metrics['acmpe_runrate']:.1f}x")
+                print(f"   📊 Available quarters: {[r['period'] for r in rows]}")
+                
+                # Show available quarters
+                print("\n[3b] Available Quarters (Limited Data)")
+                print("   Period       NI        RevalUsed   RevalSource           Interest    Core (= NI - Reval + Int)")
+                for r in rows:
+                    ni_val = r.get("ni", 0)
+                    ni_src = r.get("ni_source", "")
+                    sources = r.get("sources", [])
+                    citations = r.get("citations", [])
+                    policy = r.get("policy", "")
+                    source = r.get("source", "")
+                    
+                    if ni_src:
+                        print(f"   {r['period']}  {ni_val:>12,.0f}* {r['reval_used']:>12,.0f}  {r['reval_source']:<20}  {r['interest']:>10,.0f}  {r['core']:>18,.0f}")
+                        print(f"      *{ni_src}")
+                    else:
+                        print(f"   {r['period']}  {ni_val:>12,.0f}  {r['reval_used']:>12,.0f}  {r['reval_source']:<20}  {r['interest']:>10,.0f}  {r['core']:>18,.0f}")
+                    
+                    # Show policy and source for manual data
+                    if policy:
+                        print(f"      Policy: {policy} | Source: {source}")
+                    
+                    # Show sources and citations for manual data
+                    if sources:
+                        for source in sources:
+                            print(f"      Source: {source}")
+                    if citations:
+                        for citation in citations:
+                            print(f"      Citation: {citation}")
+                print(f"   Annualized Core: {annualized_core:,.0f}   RBV: {metrics['rbv']:,.0f}   ACMPE-RunRate: {metrics['acmpe_runrate']:.1f}x")
+            else:
+                print(f"   ⚠️  ACMPE-TTM: Need 4 aligned quarters (found {available_quarters})")
+                print(f"   📊 Available quarters: {[r['period'] for r in rows]}")
         else:
-            metrics["acmpe_runrate"] = None
-            print(f"   ⚠️  ACMPE-TTM: Need 4 post-ASU aligned quarters (found {len(rows)})")
+            print(f"   ⚠️  ACMPE-TTM: Need at least 4 aligned quarters (found {len(rows)})")
+            print("   ⚠️  Not enough quarters yet (need ≥ 4 with NI + FV/Cost).")
 
     # === Forward Projection Scenarios (real parameters) ===
     base_params = {
@@ -1154,15 +1572,14 @@ def main():
     crit = DecisionCriteria()
     eval_out = evaluate_signals(metrics, crit)
     
-    # Tighten the TL;DR gate (avoid false BUYs)
-    # Require discount + reasonable multiple + data alignment
-    if (metrics.get("mnav") is not None and metrics["mnav"] <= 0.95
-        and metrics.get("acmpe_ttm") is not None and metrics["acmpe_ttm"] <= 18):
-        decision = {"action": "BUY", "summary": "mNAV discount + reasonable ACMPE-TTM."}
-    elif metrics.get("mnav") is not None and metrics["mnav"] > 1.10:
+    # Decision gate (mNAV + ACMPE-TTM)
+    decision = {"action": "NEUTRAL", "summary": "Mixed signals or missing aligned data."}
+    if metrics.get("mnav") is not None and metrics["mnav"] > 1.10:
         decision = {"action": "HOLD/AVOID", "summary": "Premium to treasury; wait for discount or better core outlook."}
-    else:
-        decision = {"action": "NEUTRAL", "summary": "Mixed signals or missing aligned data."}
+    if (metrics.get("mnav") is not None and metrics["mnav"] <= 0.95 and
+        metrics.get("acmpe_ttm") is not None and metrics["acmpe_ttm"] <= 18 and
+        metrics.get("nav_simple", 0) > 0):
+        decision = {"action": "BUY", "summary": "mNAV discount + reasonable ACMPE-TTM."}
 
     # Build and print the explainer + TL;DR
     report = build_report(metrics, eval_out, decision, sec_data, proj_rows)
@@ -1250,6 +1667,8 @@ def main():
         print("• Power costs ($/MWh) from energy contracts")
         print("• Operating expenses from financial statements")
         print("="*60)
+
+    dqc_log_line(metrics)
 
 if __name__ == "__main__":
     main()
