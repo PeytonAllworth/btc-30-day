@@ -199,26 +199,25 @@ def fetch_sec_financials():
                 results["interest_period"] = latest_interest.get("end")
                 print(f"   Found Quarterly Interest: ${results['interest']:,.0f}")
 
-            # Try a few generic investment reval concepts (may/may not exist for BTC)
-            for concept in ("NetRealizedAndUnrealizedGainLossOnInvestments",
-                            "UnrealizedGainLossOnInvestments",
-                            "RealizedGainLossOnInvestments"):
-                units = us_gaap.get(concept, {}).get("units", {}).get("USD", [])
-                if units:
-                    latest_btc = latest_quarterly(units)
-                    results["btc_reval"] = latest_btc.get("val")
-                    results["btc_reval_period"] = latest_btc.get("end")
-                    print(f"   Found investment reval (quarterly): ${results['btc_reval']:,.0f}")
-                    break
-
-            # Final fallback: scan ALL taxonomies for custom digital asset concepts
-            if "btc_reval" not in results or results["btc_reval"] is None:
-                custom = fetch_sec_latest_custom_reval(1)
-                if custom:
-                    results["btc_reval"] = custom[0]["val"]
-                    results["btc_reval_concept"] = custom[0]["concept"]
-                    results["btc_reval_period"] = custom[0]["end"]
-                    print(f"   Found custom digital-asset reval: ${results['btc_reval']:,.0f} ({results['btc_reval_concept']})")
+            # Use strict P&L reval filtering (no balance sheet levels)
+            strict_reval = sec_reval_series_strict(12)
+            if strict_reval:
+                # Find reval for the same period as Net Income
+                ni_end = results.get("ni_period")
+                if ni_end and ni_end in strict_reval:
+                    reval_data = strict_reval[ni_end]
+                    results["btc_reval"] = reval_data["val"]
+                    results["btc_reval_concept"] = reval_data["src"]
+                    results["btc_reval_period"] = ni_end
+                    print(f"   Found P&L reval: ${results['btc_reval']:,.0f} ({results['btc_reval_concept']}) [{ni_end}]")
+                else:
+                    print(f"   ⚠️  No P&L reval found for NI period {ni_end}")
+                    results["btc_reval"] = None
+                    results["btc_reval_period"] = None
+            else:
+                print(f"   ⚠️  No P&L reval concepts found")
+                results["btc_reval"] = None
+                results["btc_reval_period"] = None
 
             # Debt: add a few common concepts and take the most recent quarterly for each
             debt_cur = us_gaap.get("DebtCurrent", {}).get("units", {}).get("USD", [])
@@ -437,6 +436,11 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
         lines.append(f"   • Core TTM (4 quarters) = {fmt_dollars(core_ttm)}")
     else:
         lines.append("   • ACMPE-TTM = N/A (insufficient data or RBV ≤ 0)")
+    
+    # Add ACMPE-RunRate if available
+    acmpe_runrate = metrics.get('acmpe_runrate')
+    if acmpe_runrate is not None:
+        lines.append(f"   • ACMPE-RunRate (last qtr ×4) = {fmt_mult(acmpe_runrate)}")
     
     # Add ACMPE-FWD (only if enabled and credible)
     acmpe_fwd = metrics.get('acmpe_fwd')
@@ -657,6 +661,60 @@ def params_quality_ok(p: dict) -> bool:
         return False
 
 
+# === Strict reval filtering (P&L only, post-ASU 2023-08) ===
+REVAL_INCLUDE = ("gain", "loss", "gainloss", "changeinfairvalue", "fairvaluechange")
+REVAL_ASSET = ("digital", "crypto", "cryptocurrency", "bitcoin", "btc")
+REVAL_EXCLUDE = ("cost", "current", "noncurrent", "purchase", "mining")  # NOTE: removed "fairvalue"
+
+def looks_like_reval_pnl(concept_name: str) -> bool:
+    """Check if concept looks like P&L revaluation, not balance sheet levels"""
+    n = concept_name.lower().replace("_", "")
+    has_signal = any(k in n for k in REVAL_INCLUDE) or ("fairvalue" in n and "change" in n)
+    return has_signal and any(k in n for k in REVAL_ASSET) and not any(k in n for k in REVAL_EXCLUDE)
+
+def sec_reval_series_strict(n: int = 12) -> dict:
+    """Return {end: {'val': float, 'filed': str, 'src': 'prefix:Concept'}} for P&L-style digital-asset reval only."""
+    out = {}
+    try:
+        cik = get_cik_from_ticker("MARA")
+        if not cik: return out
+        import time, requests
+        time.sleep(0.1)
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        headers = {'User-Agent': 'MARA-Valuation-Tool/1.0 (educational-use@example.com)'}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        facts = r.json().get("facts") or {}
+        for tax, concepts in facts.items():
+            for concept, payload in concepts.items():
+                if not looks_like_reval_pnl(concept):
+                    continue
+                usd = (payload.get("units") or {}).get("USD", [])
+                q = [x for x in usd if (x.get("fp") in {"Q1","Q2","Q3","Q4"} or x.get("qtrs")==1 or x.get("dur")=="P3M")]
+                for x in q:
+                    end, val, filed = x.get("end"), x.get("val"), x.get("filed")
+                    if end and val is not None:
+                        prev = out.get(end)
+                        if (prev is None) or (filed and prev["filed"] < filed):
+                            out[end] = {"val": float(val), "filed": filed or "", "src": f"{tax}:{concept}"}
+        # keep only post-ASU periods (fiscal years beginning 2025+)
+        post_asu_ends = [k for k in out.keys() if post_asu(k)]
+        if post_asu_ends:
+            # keep recent n post-ASU periods
+            ends = sorted(post_asu_ends)[-n:]
+            return {k: out[k] for k in ends}
+        else:
+            return {}  # no post-ASU periods found
+    except Exception as e:
+        print(f"⚠️ reval strict scan failed: {e}")
+        return out
+
+
+def post_asu(end_date: str) -> bool:
+    """Check if period is post-ASU 2023-08 (fiscal years beginning 2025+)"""
+    return end_date >= "2025-01-01"  # adjust if MARA early-adopted
+
+
 def fetch_sec_latest_custom_reval(n: int = 1):
     """
     Scan ALL taxonomies (not just us-gaap) for concepts that look like digital-asset revaluation.
@@ -694,6 +752,7 @@ def fetch_sec_latest_custom_reval(n: int = 1):
                         end = x.get("end")
                         if val is not None and end:
                             hits.append({"end": end, "val": val, "concept": f"{taxonomy}:{concept}"})
+                            print(f"     Found reval: {taxonomy}:{concept} = ${val:,.0f} ({end})")
         
         # After building hits, prefer ends that exist in NI for alignment
         if hits:
@@ -707,6 +766,14 @@ def fetch_sec_latest_custom_reval(n: int = 1):
                     print(f"   Found {len(hits)} NI-aligned reval concepts")
                 else:
                     print(f"   Found {len(hits)} reval concepts (none aligned with NI)")
+                    # Force recent data by filtering out ancient entries
+                    recent_cutoff = "2023-01-01"
+                    recent_hits = [h for h in hits if h["end"] >= recent_cutoff]
+                    if recent_hits:
+                        hits = recent_hits
+                        print(f"   Filtered to {len(hits)} recent concepts (since {recent_cutoff})")
+                    else:
+                        print(f"   ⚠️  All reval concepts are ancient (before {recent_cutoff})")
             except Exception as e:
                 print(f"   ⚠️  Could not check NI alignment: {e}")
         
@@ -929,22 +996,25 @@ def main():
         if sec_ni and abs(sec_ni - financials['reported_ni']) > 1000:
             print(f"   SEC Net Income: ${sec_ni:,.0f} (diff: ${sec_ni - financials['reported_ni']:,.0f})")
         
-        if btc_reval is not None:
-            adj_ni = financials['reported_ni'] - btc_reval
-            print(f"   BTC Reval: ${btc_reval:,.0f} | Adj NI: ${adj_ni:,.0f}")
+        # Display normalization status
+        if sec_data:
+            btc_reval = sec_data.get("btc_reval")
+            interest = sec_data.get("interest")
+            if btc_reval is not None:
+                print(f"   BTC Reval: ${btc_reval:,.0f} | Adj NI: ${financials['reported_ni'] - btc_reval:,.0f}")
+            else:
+                print("   ⚠️  BTC revaluation data not available from SEC")
+            
+            if interest is not None:
+                if btc_reval is not None:
+                    adj_ni_no_debt = (financials['reported_ni'] - btc_reval) + interest
+                    print(f"   Interest: ${interest:,.0f} | Adj NI (no debt): ${adj_ni_no_debt:,.0f}")
+                else:
+                    print(f"   Interest: ${interest:,.0f}")
+            else:
+                print("   ⚠️  Interest expense data not available from SEC")
         else:
-            print("   ⚠️  BTC revaluation data not available from SEC")
-        
-        if interest is not None:
-            adj_ni_no_debt = adj_ni + interest
-            print(f"   Interest: ${interest:,.0f} | Adj NI (no debt): ${adj_ni_no_debt:,.0f}")
-        else:
-            print("   ⚠️  Interest expense data not available from SEC")
-    elif financials:
-        print(f"📊 {financials['quarter']} | Reported NI: ${financials['reported_ni']:,.0f}")
-        print("   ⚠️  SEC data unavailable - cannot normalize")
-    else:
-        print("❌ Could not fetch financial data")
+            print("   ⚠️  SEC data unavailable - cannot normalize")
     
     # Collect metrics for decision/report
     metrics = {
@@ -971,21 +1041,49 @@ def main():
         metrics["interest"] = sec_data.get("interest")
         metrics["interest_period"] = sec_data.get("interest_period")
 
-    # Calculate ACMPE-TTM (Allworth Core Mining P/E)
-    aligned_series = build_aligned_sec_series()
-    if aligned_series and len(aligned_series) >= 3:  # Need at least 3 quarters
-        # Core TTM = sum of last 4 quarters
-        core_ttm = sum(row["core_earnings"] for row in aligned_series[-4:])
-        # RBV = Market Cap - (Treasury + Cash - Debt)
-        rbv = market_cap - (treasury_value + cash - total_debt)
-        
+    # Calculate ACMPE-TTM (Allworth Core Mining P/E) with ASU 2023-08 gating
+    # Get strict P&L reval series and check ASU compliance
+    strict_reval = sec_reval_series_strict(12)
+    ni_series = fetch_sec_quarterly_values("NetIncomeLoss", 12)
+    ie_series = fetch_sec_quarterly_values("InterestExpense", 12)
+    
+    # Build aligned periods with ASU gating
+    aligned = sorted(set(ni.get("end") for ni in ni_series) & 
+                    set(strict_reval.keys()) & 
+                    set(ie.get("end") for ie in ie_series))
+    
+    post_asu_aligned = [p for p in aligned if post_asu(p)]
+    
+    # Build core earnings rows for aligned periods
+    rows = []
+    for end in post_asu_aligned:
+        ni_val = next((item["val"] for item in ni_series if item["end"] == end), 0)
+        reval_val = strict_reval[end]["val"]
+        ie_val = next((item["val"] for item in ie_series if item["end"] == end), 0)
+        core = ni_val - reval_val + ie_val
+        rows.append({"period": end, "core": core})
+    
+    # Calculate RBV
+    rbv = market_cap - (treasury_value + cash - total_debt)
+    metrics["rbv"] = rbv
+    
+    # TTM only if 4 quarters available
+    if len(rows) >= 4:
+        core_ttm = sum(r["core"] for r in rows[-4:])
         metrics["core_ttm"] = core_ttm
-        metrics["rbv"] = rbv
         metrics["acmpe_ttm"] = (rbv / core_ttm) if (rbv > 0 and core_ttm > 0) else None
+        print(f"   ✅ ACMPE-TTM calculated from {len(rows)} post-ASU aligned quarters")
     else:
         metrics["core_ttm"] = None
-        metrics["rbv"] = None
         metrics["acmpe_ttm"] = None
+        # Optional run-rate (annualize last aligned quarter) — LABEL IT CLEARLY
+        if rows and rbv > 0 and rows[-1]["core"] > 0:
+            metrics["acmpe_runrate"] = rbv / (rows[-1]["core"] * 4)
+            print(f"   ⚠️  ACMPE-TTM: Need 4 post-ASU aligned quarters (found {len(rows)})")
+            print(f"   📊 ACMPE-RunRate (last qtr ×4): {metrics['acmpe_runrate']:.1f}x")
+        else:
+            metrics["acmpe_runrate"] = None
+            print(f"   ⚠️  ACMPE-TTM: Need 4 post-ASU aligned quarters (found {len(rows)})")
 
     # === Forward Projection Scenarios (real parameters) ===
     base_params = {
@@ -1029,19 +1127,26 @@ def main():
     else:
         metrics["acmpe_fwd"] = None  # hide forward metric unless inputs are credible
 
-    # Only compute Adjusted NI when periods match
+    # Only compute Adjusted NI when periods match and reval is P&L (not balance sheet)
     ni_p = sec_data.get("ni_period") if sec_data else None
     rev_p = sec_data.get("btc_reval_period") if sec_data else None
     int_p = sec_data.get("interest_period") if sec_data else None
 
     if ni_p and rev_p and int_p and (ni_p == rev_p == int_p):
-        adj = metrics["reported_ni"] - metrics["btc_reval"]
-        adj_no_debt = adj + metrics["interest"]
-        metrics["adj_ni"] = adj
-        metrics["adj_ni_no_debt"] = adj_no_debt
+        # Check if reval is P&L style (not balance sheet levels)
+        reval_concept = sec_data.get("btc_reval_concept", "")
+        if reval_concept and looks_like_reval_pnl(reval_concept):
+            adj = metrics["reported_ni"] - metrics["btc_reval"]
+            adj_no_debt = adj + metrics["interest"]
+            metrics["adj_ni"] = adj
+            metrics["adj_ni_no_debt"] = adj_no_debt
+            print(f"   ✅ Adjusted NI calculated with P&L reval: {reval_concept}")
+        else:
+            print(f"   ⚠️  Skipping Adjusted NI: reval concept '{reval_concept}' is not P&L style")
+            metrics["adj_ni"] = None
+            metrics["adj_ni_no_debt"] = None
     else:
-        adj = None
-        adj_no_debt = None  # skip if quarters don't align
+        print(f"   ⚠️  Skipping Adjusted NI: periods don't align (NI: {ni_p}, Reval: {rev_p}, Interest: {int_p})")
         metrics["adj_ni"] = None
         metrics["adj_ni_no_debt"] = None
 
