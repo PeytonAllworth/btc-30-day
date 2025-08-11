@@ -197,6 +197,15 @@ def fetch_sec_financials():
                     print(f"   Found investment reval (quarterly): ${results['btc_reval']:,.0f}")
                     break
 
+            # Final fallback: scan ALL taxonomies for custom digital asset concepts
+            if "btc_reval" not in results or results["btc_reval"] is None:
+                custom = fetch_sec_latest_custom_reval(1)
+                if custom:
+                    results["btc_reval"] = custom[0]["val"]
+                    results["btc_reval_concept"] = custom[0]["concept"]
+                    results["btc_reval_period"] = custom[0]["end"]
+                    print(f"   Found custom digital-asset reval: ${results['btc_reval']:,.0f} ({results['btc_reval_concept']})")
+
             # Debt: add a few common concepts and take the most recent quarterly for each
             debt_cur = us_gaap.get("DebtCurrent", {}).get("units", {}).get("USD", [])
             lt_debt = us_gaap.get("LongTermDebtNoncurrent", {}).get("units", {}).get("USD", [])
@@ -367,7 +376,7 @@ def make_recommendation(result: Dict[str, Any]) -> Dict[str, str]:
     return {"action": action, "summary": summary}
 
 
-def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Dict[str, str]) -> str:
+def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Dict[str, str], sec_data: Optional[Dict[str, Any]] = None) -> str:
     lines = []
     lines.append("=== MARA Miner Valuation — Explainer ===")
     lines.append("")
@@ -385,11 +394,35 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
     lines.append(f"   • mNAV = Market Cap / Treasury   = {fmt_float(mnav)}x")
     lines.append("")
     lines.append("[3] Normalization (strip BTC volatility, isolate debt)")
-    lines.append(f"   • Reported Net Income:           {fmt_dollars(metrics.get('reported_ni'))}")
-    lines.append(f"   • BTC Revaluation (SEC):         {fmt_dollars(metrics.get('btc_reval'))}")
-    lines.append(f"   • Interest Expense (SEC):        {fmt_dollars(metrics.get('interest'))}")
-    lines.append(f"   • Adjusted NI (no reval):        {fmt_dollars(eval_out.get('normalized_ni'))}")
-    # Optional: computed above inside evaluate_signals if you stored it; otherwise compute again safely.
+    ni_p = metrics.get('reported_ni_period')
+    br_p = metrics.get('btc_reval_period')
+    int_p = metrics.get('interest_period')
+    
+    lines.append(f"   • Reported Net Income [{metrics.get('reported_ni_source','?')}]: {fmt_dollars(metrics.get('reported_ni'))}" + (f" [{ni_p}]" if ni_p else ""))
+    br = metrics.get('btc_reval')
+    br_tag = sec_data.get('btc_reval_concept') if sec_data else None
+    lines.append(f"   • BTC Revaluation (SEC):     {fmt_dollars(br)}" + (f" [{br_tag}]" if br_tag else "") + (f" [{br_p}]" if br_p else ""))
+    lines.append(f"   • Interest Expense (SEC):    {fmt_dollars(metrics.get('interest'))}" + (f" [{int_p}]" if int_p else ""))
+    
+    if metrics["adj_ni_aligned"] is not None:
+        lines.append(f"   • Adjusted NI (aligned):     {fmt_dollars(metrics['adj_ni_aligned'])}")
+        lines.append(f"   • Adjusted NI (no debt, aligned): {fmt_dollars(metrics['adj_ni_no_debt_aligned'])}")
+    else:
+        lines.append("   • Adjusted NI: Skipped — SEC periods not aligned (apples≠oranges).")
+    
+    # Add quarterly history table
+    lines.append("")
+    lines.append("[3b] Last 4 Quarters (SEC-only, aligned)")
+    quarterly_rows = build_quarterly_history()
+    if quarterly_rows:
+        lines.append("   Period      ReportedNI   Reval    Interest   AdjNI   AdjNI(no debt)")
+        lines.append("   " + "-" * 70)
+        for row in quarterly_rows:
+            period = row["period"][:10] if row["period"] else "Unknown"
+            lines.append(f"   {period:<12} {fmt_dollars(row['reported_ni']):<11} {fmt_dollars(row['reval']):<8} {fmt_dollars(row['interest']):<9} {fmt_dollars(row['adj_ni']):<7} {fmt_dollars(row['adj_ni_no_debt'])}")
+    else:
+        lines.append("   ⚠️  Could not build quarterly history (missing data)")
+    
     lines.append("")
     lines.append("[4] Signals — Step‑by‑Step Reasoning")
     for r in eval_out["reasons"]:
@@ -432,6 +465,176 @@ def send_email_report(body: str, subject: str, to_emails: List[str]) -> bool:
     except Exception as e:
         print(f"❌ Email send failed: {e}")
         return False
+
+
+def should_send_email(action: str, period: str) -> bool:
+    """
+    Check if we should send email based on state changes.
+    Only send when action or period changes.
+    """
+    state_file = ".mara_last.json"
+    
+    try:
+        # Read current state
+        if os.path.exists(state_file):
+            with open(state_file, "r") as f:
+                last_state = json.load(f)
+        else:
+            last_state = {"action": None, "period": None}
+        
+        # Check if anything changed
+        changed = (last_state.get("action") != action or 
+                  last_state.get("period") != period)
+        
+        if changed:
+            # Update state
+            new_state = {"action": action, "period": period}
+            with open(state_file, "w") as f:
+                json.dump(new_state, f)
+            return True
+        else:
+            return False
+            
+    except Exception as e:
+        print(f"⚠️ State check failed: {e}")
+        return True  # Default to sending if state check fails
+
+
+def fetch_sec_latest_custom_reval(n: int = 1):
+    """
+    Scan ALL taxonomies (not just us-gaap) for concepts that look like digital-asset revaluation.
+    Returns a list of {end, val, concept} sorted by end date (most recent first).
+    """
+    try:
+        cik = get_cik_from_ticker("MARA")
+        if not cik: return []
+        import time, requests
+        time.sleep(0.1)
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        headers = {'User-Agent': 'MARA-Valuation-Tool/1.0 (educational-use@example.com)'}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        facts = data.get("facts", {}) or {}
+
+        # search keys for digital/crypto/bitcoin
+        hits = []
+        for taxonomy, concepts in facts.items():
+            if taxonomy.lower() == "dei":
+                continue
+            for concept, payload in concepts.items():
+                name_lc = concept.lower()
+                if any(k in name_lc for k in ("digital", "crypto", "cryptocurrency", "bitcoin")):
+                    usd = (payload.get("units") or {}).get("USD", [])
+                    # quarterly-ish filter
+                    q = [x for x in usd if (x.get("fp") in {"Q1","Q2","Q3","Q4"} or x.get("qtrs")==1 or x.get("dur")=="P3M")]
+                    for x in q:
+                        val = x.get("val")
+                        end = x.get("end")
+                        if val is not None and end:
+                            hits.append({"end": end, "val": val, "concept": f"{taxonomy}:{concept}"})
+        hits.sort(key=lambda z: z["end"], reverse=True)
+        return hits[:n]
+    except Exception as e:
+        print(f"⚠️ SEC custom reval scan failed: {e}")
+        return []
+
+
+def fetch_sec_quarterly_values(concept: str, n: int = 8) -> List[Dict[str, Any]]:
+    """
+    Fetch the last n quarterly values for a given SEC concept.
+    Returns list of {end, val} dicts sorted by end date (most recent first).
+    """
+    try:
+        cik = get_cik_from_ticker("MARA")
+        if not cik: return []
+        
+        import time
+        time.sleep(0.1)
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        headers = {'User-Agent': 'MARA-Valuation-Tool/1.0 (educational-use@example.com)'}
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        
+        us_gaap = data.get("facts", {}).get("us-gaap", {})
+        concept_data = us_gaap.get(concept, {})
+        usd_units = concept_data.get("units", {}).get("USD", [])
+        
+        if not usd_units:
+            return []
+        
+        # Filter for quarterly data
+        quarterly = [
+            x for x in usd_units
+            if x.get("fp") in {"Q1","Q2","Q3","Q4"} or x.get("qtrs") == 1 or x.get("dur") == "P3M"
+        ]
+        
+        # Sort by end date and take most recent n
+        quarterly.sort(key=lambda x: x.get("end", ""), reverse=True)
+        return [{"end": x.get("end"), "val": x.get("val")} for x in quarterly[:n]]
+        
+    except Exception as e:
+        print(f"⚠️ SEC quarterly fetch failed for {concept}: {e}")
+        return []
+
+
+def build_quarterly_history() -> List[Dict[str, Any]]:
+    """
+    Build a 4-quarter normalized history table from SEC data.
+    Returns list of dicts with aligned periods.
+    """
+    # Fetch quarterly data for each concept
+    ni = fetch_sec_quarterly_values("NetIncomeLoss", n=8)
+    ie = fetch_sec_quarterly_values("InterestExpense", n=8)
+    
+    # Try different reval concepts
+    reval = None
+    for concept in ("NetRealizedAndUnrealizedGainLossOnInvestments", 
+                   "UnrealizedGainLossOnInvestments", 
+                   "RealizedGainLossOnInvestments"):
+        reval = fetch_sec_quarterly_values(concept, n=8)
+        if reval:
+            break
+    
+    # If no standard reval, try custom digital asset concepts
+    if not reval:
+        custom = fetch_sec_latest_custom_reval(8)
+        reval = [{"end": x["end"], "val": x["val"]} for x in custom]
+    
+    if not (ni and ie and reval):
+        return []
+    
+    # Index by end date for easy lookup
+    def index_by_end(xs):
+        return {x["end"]: x["val"] for x in xs if x.get("end") and x.get("val") is not None}
+    
+    i_ni = index_by_end(ni)
+    i_ie = index_by_end(ie)
+    i_rev = index_by_end(reval)
+    
+    # Find common periods
+    common_periods = sorted(set(i_ni.keys()) & set(i_ie.keys()) & set(i_rev.keys()))[-4:]
+    
+    # Build rows
+    rows = []
+    for end in common_periods:
+        rni = i_ni[end]
+        rev = i_rev[end]
+        inx = i_ie[end]
+        adj = rni - rev
+        adj_no_debt = adj + inx
+        
+        rows.append({
+            "period": end,
+            "reported_ni": rni,
+            "reval": rev,
+            "interest": inx,
+            "adj_ni": adj,
+            "adj_ni_no_debt": adj_no_debt
+        })
+    
+    return rows
 
 
 def main():
@@ -522,13 +725,48 @@ def main():
         "interest": None
     }
 
-    # Fill in normalized pieces from your existing fetches
-    if financials:
-        metrics["reported_ni"] = financials.get("reported_ni")
+    # Prefer SEC NI for normalization; keep Yahoo for display only
+    sec_ni = sec_data.get("net_income") if sec_data else None
+    yf_ni = financials.get("reported_ni") if financials else None
+
+    # If both exist and differ a lot, warn
+    def pct_diff(a, b):
+        try:
+            return abs(a - b) / (abs(b) + 1e-9)
+        except Exception:
+            return None
+
+    if sec_ni is not None:
+        if yf_ni is not None:
+            pdiff = pct_diff(yf_ni, sec_ni)
+            if pdiff is not None and pdiff > 0.25:
+                print(f"⚠️  Data Quality: Yahoo NI {yf_ni:,.0f} vs SEC NI {sec_ni:,.0f} differ by {pdiff*100:.0f}%. Using SEC NI for normalization.")
+        metrics["reported_ni"] = sec_ni  # overwrite: normalize on SEC
+        metrics["reported_ni_source"] = "SEC"
+        metrics["reported_ni_period"] = sec_data.get("ni_period")
+    else:
+        metrics["reported_ni"] = yf_ni
+        metrics["reported_ni_source"] = "Yahoo"
 
     if sec_data:
         metrics["btc_reval"] = sec_data.get("btc_reval")
+        metrics["btc_reval_period"] = sec_data.get("btc_reval_period")
         metrics["interest"] = sec_data.get("interest")
+        metrics["interest_period"] = sec_data.get("interest_period")
+
+    # Check period alignment and compute aligned adjusted NI
+    ni_p = metrics.get('reported_ni_period')
+    br_p = metrics.get('btc_reval_period')
+    int_p = metrics.get('interest_period')
+    
+    aligned_adj = None
+    if ni_p and br_p and int_p and (ni_p == br_p == int_p):
+        aligned_adj = metrics["reported_ni"] - metrics["btc_reval"]
+        metrics["adj_ni_aligned"] = aligned_adj
+        metrics["adj_ni_no_debt_aligned"] = aligned_adj + metrics["interest"]
+    else:
+        metrics["adj_ni_aligned"] = None
+        metrics["adj_ni_no_debt_aligned"] = None
 
     # Evaluate & decide
     crit = DecisionCriteria()
@@ -536,16 +774,22 @@ def main():
     decision = make_recommendation(eval_out)
 
     # Build and print the explainer + TL;DR
-    report = build_report(metrics, eval_out, decision)
+    report = build_report(metrics, eval_out, decision, sec_data)
     print("\n" + "="*60)
     print(report)
 
-    # Optional: email if user configured recipients
+    # Optional: email if user configured recipients and state changed
     recipients_env = os.getenv("ALERT_RECIPIENTS", "")
     recipients = [e.strip() for e in recipients_env.split(",") if e.strip()]
     if recipients:
-        subject = f"MARA Signal — {decision['action']}"
-        send_email_report(report, subject, recipients)
+        # Get current period for state tracking
+        current_period = metrics.get('reported_ni_period') or "unknown"
+        
+        if should_send_email(decision['action'], current_period):
+            subject = f"MARA Signal — {decision['action']}"
+            send_email_report(report, subject, recipients)
+        else:
+            print("📧 Email skipped — no change in action or period")
     
     print("\n[C] Forward Projection — TODO")
     print("[D] Valuation — TODO")
