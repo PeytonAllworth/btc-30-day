@@ -32,6 +32,8 @@ def fetch_mara_financials():
         
         # Get quarterly income statement (replaces deprecated earnings)
         income_stmt = mara.quarterly_income_stmt
+        balance_sheet = mara.quarterly_balance_sheet
+        
         if income_stmt is not None and not income_stmt.empty:
             latest_quarter = income_stmt.iloc[:, 0]  # First column is most recent quarter
             ts = income_stmt.columns[0]  # pandas Timestamp
@@ -42,10 +44,19 @@ def fetch_mara_financials():
             if net_income is None:
                 net_income = latest_quarter.get('Net Income Common Stockholders', None)
             
+            # Get Cash from balance sheet
+            cash = None
+            if balance_sheet is not None and not balance_sheet.empty:
+                latest_balance = balance_sheet.iloc[:, 0]  # Most recent quarter
+                cash = latest_balance.get('Cash And Cash Equivalents', None)
+                if cash is None:
+                    cash = latest_balance.get('Cash', None)
+            
             if net_income is not None:
                 return {
                     "quarter": quarter_name,
                     "reported_ni": net_income,
+                    "cash": cash,
                     "btc_reval": None,  # Need to find BTC revaluation data
                     "interest": None    # Need to find interest expense data
                 }
@@ -193,10 +204,17 @@ def main():
     print(f"🏦 Treasury (BTC holdings x price): ${treasury_value:,.0f}")
     print()
 
-    cash = 100_000_000
-    total_debt = 2_630_000_000
+    # Get real cash data from financials
+    financials = fetch_mara_financials()
+    if financials and financials['cash'] is not None:
+        cash = financials['cash']
+        print(f"💵 Cash: ${cash:,.0f}")
+    else:
+        print("💵 Cash: Not found")
+        cash = 0  # Use 0 for NAV calculation if not found
+    
+    total_debt = 2_630_000_000  # Still hardcoded - need to fetch this too
     nav_simple = treasury_value + cash - total_debt
-    print(f"💵 Cash: ${cash:,.0f}")
     print(f"💳 Total Debt: ${total_debt:,.0f}")
     print(f"📈 NAV (treasury + cash - debt): ${nav_simple:,.0f}")
     print()
