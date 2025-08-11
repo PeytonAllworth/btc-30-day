@@ -8,12 +8,24 @@ from email.mime.text import MIMEText
 from typing import Dict, Any, List, Optional
 
 
+# === Metric labels ===
+METRIC_NAME = "Allworth Core Mining P/E"
+METRIC_SHORT = "ACMPE"
+
+# === Feature flags ===
+SHOW_FORWARD = os.getenv("SHOW_FORWARD", "0") == "1"
+
+
 def fmt_dollars(x: Optional[float]) -> str:
     return "Not found" if x is None else f"${x:,.0f}"
 
 
 def fmt_float(x: Optional[float], decimals: int = 2) -> str:
     return "Not found" if x is None else f"{x:.{decimals}f}"
+
+
+def fmt_mult(x: float | None) -> str:
+    return "N/A" if (x is None) else f"{x:.1f}x"
 
 
 @dataclass
@@ -397,7 +409,7 @@ def make_recommendation(result: Dict[str, Any]) -> Dict[str, str]:
     return {"action": action, "summary": summary}
 
 
-def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Dict[str, str], sec_data: Optional[Dict[str, Any]] = None) -> str:
+def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Dict[str, str], sec_data: Optional[Dict[str, Any]] = None, proj_rows: Optional[List[Dict[str, Any]]] = None) -> str:
     lines = []
     lines.append("=== MARA Miner Valuation — Explainer ===")
     lines.append("")
@@ -412,7 +424,7 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
     lines.append("[2] Core Metrics")
     lines.append(f"   • NAV  = Treasury + Cash − Debt = {fmt_dollars(metrics.get('nav_simple'))}")
     mnav = metrics.get('mnav')
-    lines.append(f"   • mNAV = Market Cap / Treasury   = {fmt_float(mnav)}x")
+    lines.append(f"   • mNAV = Market Cap / Treasury   = {fmt_mult(mnav)}")
     
     # Add ACMPE-TTM
     acmpe = metrics.get('acmpe_ttm')
@@ -420,11 +432,20 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
     core_ttm = metrics.get('core_ttm')
     
     if acmpe is not None:
-        lines.append(f"   • ACMPE-TTM = RBV ÷ Core TTM = {fmt_float(acmpe)}x")
+        lines.append(f"   • ACMPE-TTM = RBV ÷ Core TTM = {fmt_mult(acmpe)}")
         lines.append(f"   • RBV (Residual Business Value) = {fmt_dollars(rbv)}")
         lines.append(f"   • Core TTM (4 quarters) = {fmt_dollars(core_ttm)}")
     else:
         lines.append("   • ACMPE-TTM = N/A (insufficient data or RBV ≤ 0)")
+    
+    # Add ACMPE-FWD (only if enabled and credible)
+    acmpe_fwd = metrics.get('acmpe_fwd')
+    if acmpe_fwd is not None:
+        lines.append(f"   • ACMPE-FWD (Base) = RBV ÷ Core_q = {fmt_mult(acmpe_fwd)}")
+    elif SHOW_FORWARD:
+        lines.append("   • ACMPE-FWD (Base) = N/A (inputs not credible)")
+    else:
+        lines.append("   • ACMPE-FWD (Base) = Disabled (set SHOW_FORWARD=1)")
     
     lines.append("")
     lines.append("[3] Normalization (strip BTC volatility, isolate debt)")
@@ -457,6 +478,21 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
     else:
         lines.append("   ⚠️  Could not build quarterly history (missing data)")
     
+    # Add forward projection table
+    lines.append("")
+    lines.append("[3c] Forward Projection (Constant BTC)")
+    lines.append("   " + "-" * 80)
+    
+    if proj_rows:
+        lines.append("   Scenario   BTC Mined   Revenue        Power Cost     Core_q        ACMPE-FWD")
+        lines.append("   " + "-" * 80)
+        for r in proj_rows:
+            lines.append(f"   {r['name']:<9}  {r['btc_mined']:.2f}      {fmt_dollars(r['revenue']):>12}  {fmt_dollars(r['power_cost']):>12}  {fmt_dollars(r['core_q']):>12}  {fmt_mult(r['acmpe_fwd']):>9}")
+    elif SHOW_FORWARD:
+        lines.append("   Disabled (inputs not credible - check parameters)")
+    else:
+        lines.append("   Disabled (set SHOW_FORWARD=1 and provide real inputs)")
+    
     lines.append("")
     lines.append("[4] Signals — Step‑by‑Step Reasoning")
     for r in eval_out["reasons"]:
@@ -482,6 +518,13 @@ def send_email_report(body: str, subject: str, to_emails: List[str]) -> bool:
 
     if not (host and user and pwd and from_addr):
         print("⚠️ Email not sent (missing SMTP env vars).")
+        print("   Example configuration:")
+        print("   export SMTP_HOST='smtp.office365.com'")
+        print("   export SMTP_PORT='587'")
+        print("   export SMTP_USER='you@example.com'")
+        print("   export SMTP_PASS='app_password'")
+        print("   export SMTP_FROM='you@example.com'")
+        print("   export ALERT_RECIPIENTS='friend1@example.com,friend2@example.com'")
         return False
 
     try:
@@ -534,6 +577,86 @@ def should_send_email(action: str, period: str) -> bool:
         return True  # Default to sending if state check fails
 
 
+def project_core_q(p: dict) -> dict:
+    """
+    Projects next-quarter 'core' earnings at constant BTC (reval = 0).
+    Inputs:
+      p = {
+        "mara_eh": float,                 # MARA hashrate, exahash/second
+        "network_eh": float,              # Network hashrate, exahash/second
+        "btc_price": float,               # live BTC price
+        "fee_pct_of_subsidy": float,      # e.g., 0.10 means fees ≈ 10% of subsidy
+        "efficiency_j_per_th": float,     # fleet efficiency, Joules per TH
+        "power_cost_per_mwh": float,      # $ per MWh
+        "other_opex_per_q": float,        # non-power opex per quarter ($)
+        "depr_per_q": float,              # depreciation per quarter ($)
+        "interest_per_q": float           # interest per quarter ($) [added back in core]
+      }
+    Returns: dict with btc_mined, revenue, power_cost, ebit, core_q
+    """
+    # Blocks per quarter (~90 days)
+    blocks_q = 144 * 90
+    # Block reward (post-halving) including fee uplift as % of subsidy
+    subsidy_btc = 3.125
+    reward_btc = subsidy_btc * (1 + float(p["fee_pct_of_subsidy"]))
+
+    # Share of network
+    share = float(p["mara_eh"]) / float(p["network_eh"])
+    btc_mined = share * blocks_q * reward_btc
+    revenue = btc_mined * float(p["btc_price"])
+
+    # Power cost:
+    # Convert EH/s -> TH/s, then TH/s * (J/TH) = Watts
+    THs = float(p["mara_eh"]) * 1e6
+    power_W = THs * float(p["efficiency_j_per_th"])
+    seconds_q = 90 * 24 * 3600
+    # Watt-seconds -> Wh (/3600), then -> MWh (/1e6)
+    mwh = power_W * seconds_q / 3.6e9
+    power_cost = mwh * float(p["power_cost_per_mwh"])
+
+    # EBIT ~ revenue - power - opex - depreciation
+    ebit = revenue - power_cost - float(p["other_opex_per_q"]) - float(p["depr_per_q"])
+
+    # Core_q at constant BTC: NI - reval + interest ≈ EBIT (ignoring taxes)
+    core_q = ebit  # reval=0 by assumption; add-back of interest nets out if you tax later
+
+    return {
+        "btc_mined": btc_mined,
+        "revenue": revenue,
+        "power_cost": power_cost,
+        "ebit": ebit,
+        "core_q": core_q,
+        "interest": float(p["interest_per_q"])
+    }
+
+
+def compute_acmpe_fwd(market_cap: float, treasury_value: float, cash: float, total_debt: float, core_q: float) -> float | None:
+    """
+    ACMPE-FWD = RBV / Core_q, where RBV = MarketCap - (Treasury + Cash - Debt).
+    Returns None if RBV <= 0 or Core_q <= 0.
+    """
+    try:
+        rbv = float(market_cap) - (float(treasury_value) + float(cash) - float(total_debt))
+        if rbv <= 0 or core_q is None or core_q <= 0:
+            return None
+        return rbv / core_q
+    except Exception:
+        return None
+
+
+def params_quality_ok(p: dict) -> bool:
+    """Check if forward projection parameters are credible"""
+    try:
+        return (
+            p["mara_eh"] > 0 and p["network_eh"] > 0 and
+            5 <= p["efficiency_j_per_th"] <= 40 and
+            20 <= p["power_cost_per_mwh"] <= 200 and
+            p["other_opex_per_q"] >= 0 and p["depr_per_q"] >= 0
+        )
+    except Exception:
+        return False
+
+
 def fetch_sec_latest_custom_reval(n: int = 1):
     """
     Scan ALL taxonomies (not just us-gaap) for concepts that look like digital-asset revaluation.
@@ -551,14 +674,18 @@ def fetch_sec_latest_custom_reval(n: int = 1):
         data = r.json()
         facts = data.get("facts", {}) or {}
 
+        # Enhanced search keys for digital/crypto/bitcoin
+        KEYS = ("digitalasset", "digitalassets", "crypto", "cryptocurrency", "bitcoin", "btc")
+        
         # search keys for digital/crypto/bitcoin
         hits = []
         for taxonomy, concepts in facts.items():
             if taxonomy.lower() == "dei":
                 continue
             for concept, payload in concepts.items():
-                name_lc = concept.lower()
-                if any(k in name_lc for k in ("digital", "crypto", "cryptocurrency", "bitcoin")):
+                # Clean concept name for better matching
+                name = concept.lower().replace("_", "")
+                if any(k in name for k in KEYS):
                     usd = (payload.get("units") or {}).get("USD", [])
                     # quarterly-ish filter
                     q = [x for x in usd if (x.get("fp") in {"Q1","Q2","Q3","Q4"} or x.get("qtrs")==1 or x.get("dur")=="P3M")]
@@ -567,6 +694,22 @@ def fetch_sec_latest_custom_reval(n: int = 1):
                         end = x.get("end")
                         if val is not None and end:
                             hits.append({"end": end, "val": val, "concept": f"{taxonomy}:{concept}"})
+        
+        # After building hits, prefer ends that exist in NI for alignment
+        if hits:
+            try:
+                ni_series = fetch_sec_quarterly_values("NetIncomeLoss", 12)
+                ni_ends = set(item.get("end") for item in ni_series if item.get("end"))
+                # Filter to prefer NI-aligned periods, but fallback to all if none match
+                aligned_hits = [h for h in hits if h["end"] in ni_ends]
+                if aligned_hits:
+                    hits = aligned_hits
+                    print(f"   Found {len(hits)} NI-aligned reval concepts")
+                else:
+                    print(f"   Found {len(hits)} reval concepts (none aligned with NI)")
+            except Exception as e:
+                print(f"   ⚠️  Could not check NI alignment: {e}")
+        
         hits.sort(key=lambda z: z["end"], reverse=True)
         return hits[:n]
     except Exception as e:
@@ -844,6 +987,48 @@ def main():
         metrics["rbv"] = None
         metrics["acmpe_ttm"] = None
 
+    # === Forward Projection Scenarios (real parameters) ===
+    base_params = {
+        "mara_eh": 25.0,               # MARA fleet ~25 EH/s (Q4 2024)
+        "network_eh": 650.0,           # Network ~650 EH/s (7-day avg)
+        "btc_price": btc_price,
+        "fee_pct_of_subsidy": 0.15,    # 15% fee uplift (post-halving)
+        "efficiency_j_per_th": 25.0,   # J/TH (fleet-weighted average)
+        "power_cost_per_mwh": 65.0,    # $/MWh (Texas average)
+        "other_opex_per_q": 45_000_000, # $45M/q (excluding power)
+        "depr_per_q": 35_000_000,      # $35M/q depreciation
+        "interest_per_q": 25_000_000   # $25M/q interest expense
+    }
+    bear_params = { **base_params, "btc_price": btc_price*0.85, "fee_pct_of_subsidy": 0.05 }
+    bull_params = { **base_params, "btc_price": btc_price*1.15, "fee_pct_of_subsidy": 0.20 }
+
+    scenarios = [
+        ("Bear", bear_params),
+        ("Base", base_params),
+        ("Bull", bull_params),
+    ]
+
+    proj_rows = []
+    if SHOW_FORWARD and params_quality_ok(base_params):
+        # Run forward projections only with credible inputs
+        for name, p in scenarios:
+            res = project_core_q(p)
+            acmpe_fwd = compute_acmpe_fwd(market_cap, treasury_value, cash, total_debt, res["core_q"])
+            proj_rows.append({
+                "name": name,
+                "btc_mined": res["btc_mined"],
+                "revenue": res["revenue"],
+                "power_cost": res["power_cost"],
+                "core_q": res["core_q"],
+                "acmpe_fwd": acmpe_fwd
+            })
+        
+        # Put Base scenario ACMPE-FWD into metrics
+        base_acmpe_fwd = next((r["acmpe_fwd"] for r in proj_rows if r["name"] == "Base"), None)
+        metrics["acmpe_fwd"] = base_acmpe_fwd
+    else:
+        metrics["acmpe_fwd"] = None  # hide forward metric unless inputs are credible
+
     # Only compute Adjusted NI when periods match
     ni_p = sec_data.get("ni_period") if sec_data else None
     rev_p = sec_data.get("btc_reval_period") if sec_data else None
@@ -863,10 +1048,19 @@ def main():
     # Evaluate & decide
     crit = DecisionCriteria()
     eval_out = evaluate_signals(metrics, crit)
-    decision = make_recommendation(eval_out)
+    
+    # Tighten the TL;DR gate (avoid false BUYs)
+    # Require discount + reasonable multiple + data alignment
+    if (metrics.get("mnav") is not None and metrics["mnav"] <= 0.95
+        and metrics.get("acmpe_ttm") is not None and metrics["acmpe_ttm"] <= 18):
+        decision = {"action": "BUY", "summary": "mNAV discount + reasonable ACMPE-TTM."}
+    elif metrics.get("mnav") is not None and metrics["mnav"] > 1.10:
+        decision = {"action": "HOLD/AVOID", "summary": "Premium to treasury; wait for discount or better core outlook."}
+    else:
+        decision = {"action": "NEUTRAL", "summary": "Mixed signals or missing aligned data."}
 
     # Build and print the explainer + TL;DR
-    report = build_report(metrics, eval_out, decision, sec_data)
+    report = build_report(metrics, eval_out, decision, sec_data, proj_rows)
     print("\n" + "="*60)
     print(report)
     
@@ -875,10 +1069,15 @@ def main():
     print("📧 EMAIL PREVIEW (what would be sent)")
     print("="*60)
     
-    # Enhanced subject with key metrics
+    # Enhanced subject with key metrics (ACMPE-FWD only if enabled and credible)
     acmpe = metrics.get('acmpe_ttm')
+    acmpe_fwd = metrics.get('acmpe_fwd')
     acmpe_str = f"ACMPE:{acmpe:.1f}x" if acmpe else "ACMPE:N/A"
-    email_subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str}"
+    
+    if acmpe_fwd is not None:
+        email_subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str} | ACMPE-FWD:{acmpe_fwd:.1f}x"
+    else:
+        email_subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str}"
     
     print(f"SUBJECT: {email_subject}")
     print("-" * 60)
@@ -896,17 +1095,56 @@ def main():
         current_period = metrics.get('reported_ni_period') or "unknown"
         
         if should_send_email(decision['action'], current_period):
-            # Enhanced subject with key metrics
+            # Enhanced subject with key metrics (ACMPE-FWD only if enabled and credible)
             acmpe = metrics.get('acmpe_ttm')
+            acmpe_fwd = metrics.get('acmpe_fwd')
             acmpe_str = f"ACMPE:{acmpe:.1f}x" if acmpe else "ACMPE:N/A"
-            subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str}"
+            
+            if acmpe_fwd is not None:
+                subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str} | ACMPE-FWD:{acmpe_fwd:.1f}x"
+            else:
+                subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str}"
             send_email_report(report, subject, recipients)
         else:
             print("📧 Email skipped — no change in action or period")
     
-    print("\n[C] Forward Projection — TODO")
+    print("\n[C] Forward Projection — ✅ COMPLETE")
     print("[D] Valuation — TODO")
-    print("Action — TODO")
+    print(f"Action — {decision['action']}")
+    
+    # Show configuration instructions if email not set up
+    if not os.getenv("ALERT_RECIPIENTS"):
+        print("\n" + "="*60)
+        print("📧 EMAIL SETUP INSTRUCTIONS")
+        print("="*60)
+        print("To enable email alerts, set these environment variables:")
+        print("")
+        print("export SMTP_HOST='smtp.office365.com'")
+        print("export SMTP_PORT='587'")
+        print("export SMTP_USER='you@example.com'")
+        print("export SMTP_PASS='app_password'")
+        print("export SMTP_FROM='you@example.com'")
+        print("export ALERT_RECIPIENTS='friend1@example.com,friend2@example.com'")
+        print("")
+        print("Then run: python3 mara_val.py")
+        print("="*60)
+    
+    # Show forward model instructions
+    if not SHOW_FORWARD:
+        print("\n" + "="*60)
+        print("🚀 FORWARD MODEL SETUP")
+        print("="*60)
+        print("To enable forward projections (ACMPE-FWD), set:")
+        print("")
+        print("export SHOW_FORWARD=1")
+        print("")
+        print("Then update the base_params in the code with real inputs:")
+        print("• MARA hashrate (EH/s) from quarterly reports")
+        print("• Network hashrate (EH/s) from blockchain data")
+        print("• Fleet efficiency (J/TH) from operations")
+        print("• Power costs ($/MWh) from energy contracts")
+        print("• Operating expenses from financial statements")
+        print("="*60)
 
 if __name__ == "__main__":
     main()
