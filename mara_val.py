@@ -293,6 +293,8 @@ def evaluate_signals(metrics: Dict[str, Any], crit: DecisionCriteria) -> Dict[st
       - reported_ni (float or None)
       - btc_reval (float or None)
       - interest (float or None)
+      - acmpe_ttm (float or None)
+      - rbv (float or None)
     Returns dict with 'signals' (list of reasons) and a 'score' + 'normalized_ni'
     """
     reasons: List[str] = []
@@ -303,6 +305,8 @@ def evaluate_signals(metrics: Dict[str, Any], crit: DecisionCriteria) -> Dict[st
     reported_ni = metrics.get("reported_ni")
     btc_reval = metrics.get("btc_reval")
     interest = metrics.get("interest")
+    acmpe_ttm = metrics.get("acmpe_ttm")
+    rbv = metrics.get("rbv")
 
     # 1) mNAV signal
     if mnav is not None:
@@ -354,6 +358,21 @@ def evaluate_signals(metrics: Dict[str, Any], crit: DecisionCriteria) -> Dict[st
     else:
         reasons.append("Reported NI not available.")
 
+    # 4) ACMPE-TTM signal (new mining P/E metric)
+    if acmpe_ttm is not None and rbv is not None:
+        if rbv > 0:
+            if acmpe_ttm <= 20:  # Conservative threshold
+                reasons.append(f"ACMPE-TTM {acmpe_ttm:.1f}x ≤ 20x (mining operations reasonably priced).")
+                score += 1
+            else:
+                reasons.append(f"ACMPE-TTM {acmpe_ttm:.1f}x > 20x (mining operations expensive).")
+                score -= 1
+        else:
+            reasons.append(f"RBV {fmt_dollars(rbv)} ≤ 0 (market prices at/under asset value).")
+            score -= 1
+    else:
+        reasons.append("ACMPE-TTM not available (insufficient aligned data).")
+
     return {
         "reasons": reasons,
         "score": score,
@@ -394,6 +413,19 @@ def build_report(metrics: Dict[str, Any], eval_out: Dict[str, Any], decision: Di
     lines.append(f"   • NAV  = Treasury + Cash − Debt = {fmt_dollars(metrics.get('nav_simple'))}")
     mnav = metrics.get('mnav')
     lines.append(f"   • mNAV = Market Cap / Treasury   = {fmt_float(mnav)}x")
+    
+    # Add ACMPE-TTM
+    acmpe = metrics.get('acmpe_ttm')
+    rbv = metrics.get('rbv')
+    core_ttm = metrics.get('core_ttm')
+    
+    if acmpe is not None:
+        lines.append(f"   • ACMPE-TTM = RBV ÷ Core TTM = {fmt_float(acmpe)}x")
+        lines.append(f"   • RBV (Residual Business Value) = {fmt_dollars(rbv)}")
+        lines.append(f"   • Core TTM (4 quarters) = {fmt_dollars(core_ttm)}")
+    else:
+        lines.append("   • ACMPE-TTM = N/A (insufficient data or RBV ≤ 0)")
+    
     lines.append("")
     lines.append("[3] Normalization (strip BTC volatility, isolate debt)")
     ni_p = sec_data.get('ni_period') if sec_data else None
@@ -639,6 +671,64 @@ def build_quarterly_history() -> List[Dict[str, Any]]:
     return rows
 
 
+def build_aligned_sec_series() -> List[Dict[str, Any]]:
+    """
+    Build aligned SEC series for last 8 quarters: NetIncomeLoss, InterestExpense, DigitalAssetReval.
+    Returns list of dicts with matching end dates.
+    """
+    # Fetch quarterly data for each concept
+    ni = fetch_sec_quarterly_values("NetIncomeLoss", n=8)
+    ie = fetch_sec_quarterly_values("InterestExpense", n=8)
+    
+    # Try different reval concepts
+    reval = None
+    for concept in ("NetRealizedAndUnrealizedGainLossOnInvestments", 
+                   "UnrealizedGainLossOnInvestments", 
+                   "RealizedGainLossOnInvestments"):
+        reval = fetch_sec_quarterly_values(concept, n=8)
+        if reval:
+            break
+    
+    # If no standard reval, try custom digital asset concepts
+    if not reval:
+        custom = fetch_sec_latest_custom_reval(8)
+        reval = [{"end": x["end"], "val": x["val"]} for x in custom]
+    
+    if not (ni and ie and reval):
+        return []
+    
+    # Index by end date for easy lookup
+    def index_by_end(xs):
+        return {x["end"]: x["val"] for x in xs if x.get("end") and x.get("val") is not None}
+    
+    i_ni = index_by_end(ni)
+    i_ie = index_by_end(ie)
+    i_rev = index_by_end(reval)
+    
+    # Find common periods (all three concepts must have data)
+    common_periods = sorted(set(i_ni.keys()) & set(i_ie.keys()) & set(i_rev.keys()))
+    
+    # Build aligned rows
+    rows = []
+    for end in common_periods:
+        ni_val = i_ni[end]
+        reval_val = i_rev[end]
+        interest_val = i_ie[end]
+        
+        # Core earnings = NI - Reval + Interest
+        core_q = ni_val - reval_val + interest_val
+        
+        rows.append({
+            "period": end,
+            "net_income": ni_val,
+            "digital_asset_reval": reval_val,
+            "interest_expense": interest_val,
+            "core_earnings": core_q
+        })
+    
+    return rows
+
+
 def main():
     print("=== MARA Miner Valuation Tool (Quick-Start) ===")
     print()
@@ -738,6 +828,22 @@ def main():
         metrics["interest"] = sec_data.get("interest")
         metrics["interest_period"] = sec_data.get("interest_period")
 
+    # Calculate ACMPE-TTM (Allworth Core Mining P/E)
+    aligned_series = build_aligned_sec_series()
+    if aligned_series and len(aligned_series) >= 3:  # Need at least 3 quarters
+        # Core TTM = sum of last 4 quarters
+        core_ttm = sum(row["core_earnings"] for row in aligned_series[-4:])
+        # RBV = Market Cap - (Treasury + Cash - Debt)
+        rbv = market_cap - (treasury_value + cash - total_debt)
+        
+        metrics["core_ttm"] = core_ttm
+        metrics["rbv"] = rbv
+        metrics["acmpe_ttm"] = (rbv / core_ttm) if (rbv > 0 and core_ttm > 0) else None
+    else:
+        metrics["core_ttm"] = None
+        metrics["rbv"] = None
+        metrics["acmpe_ttm"] = None
+
     # Only compute Adjusted NI when periods match
     ni_p = sec_data.get("ni_period") if sec_data else None
     rev_p = sec_data.get("btc_reval_period") if sec_data else None
@@ -763,6 +869,24 @@ def main():
     report = build_report(metrics, eval_out, decision, sec_data)
     print("\n" + "="*60)
     print(report)
+    
+    # Show exactly what the email would look like
+    print("\n" + "="*60)
+    print("📧 EMAIL PREVIEW (what would be sent)")
+    print("="*60)
+    
+    # Enhanced subject with key metrics
+    acmpe = metrics.get('acmpe_ttm')
+    acmpe_str = f"ACMPE:{acmpe:.1f}x" if acmpe else "ACMPE:N/A"
+    email_subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str}"
+    
+    print(f"SUBJECT: {email_subject}")
+    print("-" * 60)
+    print("RECIPIENTS: " + (os.getenv("ALERT_RECIPIENTS", "Not configured") or "Not configured"))
+    print("-" * 60)
+    print("BODY:")
+    print(report)
+    print("="*60)
 
     # Optional: email if user configured recipients and state changed
     recipients_env = os.getenv("ALERT_RECIPIENTS", "")
@@ -772,7 +896,10 @@ def main():
         current_period = metrics.get('reported_ni_period') or "unknown"
         
         if should_send_email(decision['action'], current_period):
-            subject = f"MARA Signal — {decision['action']}"
+            # Enhanced subject with key metrics
+            acmpe = metrics.get('acmpe_ttm')
+            acmpe_str = f"ACMPE:{acmpe:.1f}x" if acmpe else "ACMPE:N/A"
+            subject = f"MARA Signal — {decision['action']} | mNAV:{mnav:.2f}x | {acmpe_str}"
             send_email_report(report, subject, recipients)
         else:
             print("📧 Email skipped — no change in action or period")
